@@ -1,0 +1,783 @@
+Appendix H: Detailed Deployment and Management Scripts
+
+H.1. Main Deployment Script (deploy.sh)
+bash
+
+#!/bin/bash
+set -e
+
+# Configuration
+export PROJECT_NAME="zero1"
+export ENVIRONMENT="${1:-staging}"
+export COMPOSE_PROFILES="${2:-all}"
+
+# Environment validation
+validate_environment() {
+    echo "🔍 Validating environment..."
+    
+    # Check required variables
+    required_vars=("DB_PASSWORD" "MINIO_ROOT_PASSWORD" "GRAFANA_PASSWORD")
+    for var in "${required_vars[@]}"; do
+        if [ -z "${!var}" ]; then
+            echo "❌ Variable $var is not set"
+            exit 1
+        fi
+    done
+    
+    # Check Docker
+    if ! command -v docker &> /dev/null; then
+        echo "❌ Docker is not installed"
+        exit 1
+    fi
+    
+    # Check Docker Compose
+    if ! docker compose version &> /dev/null; then
+        echo "❌ Docker Compose is not installed"
+        exit 1
+    fi
+    
+    # Check NVIDIA Docker (if required)
+    if [[ "$COMPOSE_PROFILES" == *"gpu"* ]]; then
+        if ! docker run --rm --gpus all nvidia/cuda:12.1.0-base nvidia-smi &> /dev/null; then
+            echo "❌ NVIDIA Docker is not configured"
+            exit 1
+        fi
+    fi
+    
+    echo "✅ Environment validated"
+}
+
+# Infrastructure initialization
+init_infrastructure() {
+    echo "🏗️  Initializing infrastructure..."
+    
+    # Create Docker networks
+    docker network create ${PROJECT_NAME}-backend 2>/dev/null || true
+    docker network create ${PROJECT_NAME}-monitoring 2>/dev/null || true
+    
+    # Create data directories
+    mkdir -p ./data/{postgres,minio,elasticsearch,prometheus,grafana}
+    
+    # Set permissions
+    chown -R 1000:1000 ./data/postgres
+    chown -R 1000:1000 ./data/minio
+    chown -R 1000:1000 ./data/elasticsearch
+    
+    echo "✅ Infrastructure ready"
+}
+
+# Deploy base services
+deploy_base_services() {
+    echo "🚀 Deploying base services..."
+    
+    # Start base stack
+    docker compose --profile base up -d \
+        postgres \
+        minio \
+        elasticsearch \
+        kibana
+    
+    # Wait for services to be ready
+    wait_for_service "PostgreSQL" "pg_isready -U zero1" 60
+    wait_for_service "MinIO" "curl -f http://localhost:9000/minio/health/live" 30
+    wait_for_service "Elasticsearch" "curl -f http://localhost:9200/_cluster/health" 45
+    
+    # Initialize databases
+    echo "📦 Initializing databases..."
+    docker compose exec -T postgres psql -U zero1 -d zero1 < ./sql/init_schema.sql
+    docker compose exec -T postgres psql -U zero1 -d zero1 < ./sql/seed_data.sql
+    
+    # Configure MinIO
+    echo "🪣 Configuring MinIO..."
+    docker compose run --rm mc mb minio/zero1-artifacts
+    docker compose run --rm mc anonymous set download minio/zero1-artifacts
+    
+    echo "✅ Base services running"
+}
+
+# Deploy ML services
+deploy_ml_services() {
+    echo "🧠 Deploying ML services..."
+    
+    # Load models (if no local copies exist)
+    if [ ! -f "./models/llama-3.1-8b-ft.tar.gz" ]; then
+        echo "⬇️  Downloading models..."
+        wget -O ./models/llama-3.1-8b-ft.tar.gz \
+            https://storage.example.com/models/llama-3.1-8b-ft.tar.gz
+        tar -xzf ./models/llama-3.1-8b-ft.tar.gz -C ./models/
+    fi
+    
+    # Start ML services
+    docker compose --profile ml up -d \
+        ml-service \
+        ml-cache
+    
+    # Wait for readiness
+    wait_for_service "ML Service" "curl -f http://localhost:8080/health" 120
+    
+    echo "✅ ML services running"
+}
+
+# Deploy main application services
+deploy_app_services() {
+    echo "⚙️  Deploying application services..."
+    
+    # Start application
+    docker compose --profile app up -d \
+        zero1-controller \
+        verifier \
+        scheduler \
+        worker
+    
+    # Wait for readiness
+    wait_for_service "Controller" "curl -f http://localhost:8000/api/v1/health" 30
+    wait_for_service "Verifier" "curl -f http://localhost:8081/health" 30
+    
+    # Configure task scheduler
+    echo "⏰ Configuring scheduler..."
+    docker compose exec scheduler python init_scheduler.py
+    
+    echo "✅ Application services running"
+}
+
+# Deploy monitoring
+deploy_monitoring() {
+    echo "📊 Deploying monitoring..."
+    
+    # Start monitoring
+    docker compose --profile monitoring up -d \
+        prometheus \
+        grafana \
+        node-exporter \
+        cadvisor
+    
+    # Wait for readiness
+    wait_for_service "Prometheus" "curl -f http://localhost:9090/-/healthy" 30
+    wait_for_service "Grafana" "curl -f http://localhost:3000/api/health" 45
+    
+    # Configure Grafana
+    echo "⚙️  Configuring Grafana..."
+    docker compose exec grafana grafana-cli admin reset-admin-password $GRAFANA_PASSWORD
+    
+    # Import dashboards
+    curl -X POST \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -d @./monitoring/dashboards/zero1-overview.json \
+        http://admin:$GRAFANA_PASSWORD@localhost:3000/api/dashboards/db
+    
+    echo "✅ Monitoring started"
+}
+
+# Helper function to wait for a service
+wait_for_service() {
+    local service_name=$1
+    local check_command=$2
+    local timeout=$3
+    local start_time=$(date +%s)
+    
+    echo -n "⏳ Waiting for $service_name..."
+    
+    while true; do
+        # Check timeout
+        local current_time=$(date +%s)
+        local elapsed=$((current_time - start_time))
+        
+        if [ $elapsed -ge $timeout ]; then
+            echo "❌"
+            echo "Timeout waiting for $service_name"
+            exit 1
+        fi
+        
+        # Try to connect
+        if eval "$check_command" &> /dev/null; then
+            echo "✅"
+            return 0
+        fi
+        
+        sleep 2
+        echo -n "."
+    done
+}
+
+# Main logic
+main() {
+    echo "🚀 Starting Project ZERO-1 deployment"
+    echo "📌 Environment: $ENVIRONMENT"
+    echo "📌 Profiles: $COMPOSE_PROFILES"
+    
+    # Check privileges
+    if [ "$EUID" -ne 0 ]; then
+        echo "⚠️  Script running without root privileges"
+        read -p "Continue? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
+    fi
+    
+    # Execute deployment stages
+    validate_environment
+    init_infrastructure
+    
+    case "$COMPOSE_PROFILES" in
+        "all")
+            deploy_base_services
+            deploy_ml_services
+            deploy_app_services
+            deploy_monitoring
+            ;;
+        "base")
+            deploy_base_services
+            ;;
+        "ml")
+            deploy_ml_services
+            ;;
+        "app")
+            deploy_app_services
+            ;;
+        "monitoring")
+            deploy_monitoring
+            ;;
+        *)
+            echo "❌ Unknown profile: $COMPOSE_PROFILES"
+            exit 1
+            ;;
+    esac
+    
+    # Final system check
+    echo "🔍 Final system check..."
+    sleep 10
+    
+    # Check all services
+    services=$(docker compose ps --services)
+    for service in $services; do
+        if [ "$(docker compose ps -q $service)" ]; then
+            status=$(docker compose ps --format json | jq -r ".[] | select(.Service==\"$service\") | .Status")
+            echo "  $service: $status"
+        else
+            echo "  ❌ $service: NOT RUNNING"
+        fi
+    done
+    
+    echo ""
+    echo "🎉 Deployment completed!"
+    echo ""
+    echo "🌐 Service access:"
+    echo "  • Controller API: http://localhost:8000/docs"
+    echo "  • MinIO Console: http://localhost:9001"
+    echo "  • Kibana: http://localhost:5601"
+    echo "  • Grafana: http://localhost:3000"
+    echo "  • Prometheus: http://localhost:9090"
+    echo ""
+    echo "🔑 Credentials are in the .env file"
+}
+
+# Execute main function
+main "$@"
+
+H.2. System Management Script (manage-system.sh)
+bash
+
+#!/bin/bash
+
+COMMAND="${1:-help}"
+SERVICE="${2:-all}"
+
+case $COMMAND in
+    start)
+        echo "▶️  Starting system..."
+        docker compose start $SERVICE
+        ;;
+        
+    stop)
+        echo "⏸️  Stopping system..."
+        docker compose stop $SERVICE
+        ;;
+        
+    restart)
+        echo "🔄 Restarting system..."
+        docker compose restart $SERVICE
+        ;;
+        
+    status)
+        echo "📊 System status:"
+        docker compose ps
+        
+        echo ""
+        echo "📈 Metrics:"
+        docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" | head -10
+        ;;
+        
+    logs)
+        echo "📋 System logs:"
+        docker compose logs --tail=100 -f $SERVICE
+        ;;
+        
+    backup)
+        echo "💾 Creating backup..."
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        BACKUP_DIR="./backups/backup_$TIMESTAMP"
+        
+        mkdir -p $BACKUP_DIR
+        
+        # Backup databases
+        docker compose exec -T postgres pg_dump -U zero1 zero1 > $BACKUP_DIR/database.sql
+        docker compose exec -T postgres pg_dump -U zero1 --schema-only zero1 > $BACKUP_DIR/schema.sql
+        
+        # Backup configurations
+        cp -r ./config $BACKUP_DIR/
+        cp .env $BACKUP_DIR/
+        
+        # Backup Docker volumes
+        docker run --rm \
+            -v ${PROJECT_NAME}_postgres_data:/source:ro \
+            -v $(pwd)/$BACKUP_DIR:/backup \
+            alpine tar czf /backup/postgres_data.tar.gz -C /source .
+        
+        # Create archive
+        tar czf ./backups/system_backup_$TIMESTAMP.tar.gz -C ./backups backup_$TIMESTAMP
+        
+        echo "✅ Backup created: backups/system_backup_$TIMESTAMP.tar.gz"
+        ;;
+        
+    update)
+        echo "🔄 Updating system..."
+        
+        # Update images
+        docker compose pull
+        
+        # Stop system
+        docker compose down
+        
+        # Start with new images
+        docker compose up -d
+        
+        # Apply migrations
+        docker compose exec -T postgres psql -U zero1 -d zero1 < ./sql/migrations/latest.sql
+        
+        echo "✅ System updated"
+        ;;
+        
+    cleanup)
+        echo "🧹 Cleaning system..."
+        
+        read -p "Stop and delete all containers? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            docker compose down -v
+            docker system prune -af
+            echo "✅ System cleaned"
+        fi
+        ;;
+        
+    test-cycle)
+        echo "🧪 Starting test cycle..."
+        
+        CYCLE_ID=$(uuidgen)
+        
+        # Start cycle via API
+        curl -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"cycle_id\": \"$CYCLE_ID\", \"target\": \"csr1000v-test\", \"stig_id\": \"V-220668\"}" \
+            http://localhost:8000/api/v1/cycle/start
+            
+        echo "✅ Cycle started: $CYCLE_ID"
+        
+        # Monitor progress
+        while true; do
+            STATUS=$(curl -s http://localhost:8000/api/v1/cycle/$CYCLE_ID/status | jq -r '.status')
+            echo "Status: $STATUS"
+            
+            if [[ "$STATUS" == "completed" ]] || [[ "$STATUS" == "failed" ]]; then
+                break
+            fi
+            
+            sleep 10
+        done
+        
+        # Get result
+        curl -s http://localhost:8000/api/v1/cycle/$CYCLE_ID/report | jq .
+        ;;
+        
+    *)
+        echo "Usage: $0 {start|stop|restart|status|logs|backup|update|cleanup|test-cycle} [service]"
+        echo ""
+        echo "Commands:"
+        echo "  start       - Start system or specific service"
+        echo "  stop        - Stop system or service"
+        echo "  restart     - Restart system or service"
+        echo "  status      - Show system status and metrics"
+        echo "  logs        - Show system or service logs"
+        echo "  backup      - Create full system backup"
+        echo "  update      - Update all images and restart"
+        echo "  cleanup     - Clean all containers and images"
+        echo "  test-cycle  - Start test cycle"
+        ;;
+esac
+
+H.3. Monitoring and Alerting Script (monitor.sh)
+bash
+
+#!/bin/bash
+
+# Configuration
+ALERT_THRESHOLDS=(
+    "cpu_usage:80"
+    "memory_usage:85"
+    "disk_usage:90"
+    "container_restarts:5"
+    "api_latency_ms:5000"
+    "error_rate:5"
+)
+
+# Check metrics
+check_metrics() {
+    echo "📊 Checking system metrics..."
+    
+    # CPU Usage
+    CPU_USAGE=$(docker stats --no-stream --format "{{.CPUPerc}}" | sed 's/%//' | awk '{sum+=$1} END {print sum/NR}')
+    if (( $(echo "$CPU_USAGE > 80" | bc -l) )); then
+        send_alert "high_cpu" "CPU usage: ${CPU_USAGE}%"
+    fi
+    
+    # Memory Usage
+    MEM_USAGE=$(docker stats --no-stream --format "{{.MemUsage}}" | awk '{print $1}' | sed 's/%//' | awk '{sum+=$1} END {print sum/NR}')
+    if (( $(echo "$MEM_USAGE > 85" | bc -l) )); then
+        send_alert "high_memory" "Memory usage: ${MEM_USAGE}%"
+    fi
+    
+    # Container Health
+    UNHEALTHY=$(docker ps --filter "health=unhealthy" --format "{{.Names}}" | wc -l)
+    if [ $UNHEALTHY -gt 0 ]; then
+        send_alert "unhealthy_containers" "Unhealthy containers: $UNHEALTHY"
+    fi
+    
+    # API Latency
+    API_LATENCY=$(curl -o /dev/null -s -w '%{time_total}\n' http://localhost:8000/api/v1/health)
+    if (( $(echo "$API_LATENCY > 5" | bc -l) )); then
+        send_alert "high_latency" "API latency: ${API_LATENCY}s"
+    fi
+    
+    # Database Connections
+    DB_CONNS=$(docker compose exec -T postgres psql -U zero1 -t -c "SELECT count(*) FROM pg_stat_activity WHERE state = 'active';")
+    if [ $DB_CONNS -gt 50 ]; then
+        send_alert "high_db_connections" "Active DB connections: $DB_CONNS"
+    fi
+}
+
+# Check data integrity
+check_data_integrity() {
+    echo "🔍 Checking data integrity..."
+    
+    # Check artifact hashes
+    INTEGRITY_ERRORS=0
+    
+    # Check last 10 cycles
+    CYCLES=$(docker compose exec -T postgres psql -U zero1 -t -c "SELECT cycle_id FROM test_cycles ORDER BY created_at DESC LIMIT 10;")
+    
+    for CYCLE in $CYCLES; do
+        CYCLE=$(echo $CYCLE | xargs)
+        
+        # Check Merkle Root
+        EXPECTED_ROOT=$(docker compose exec -T postgres psql -U zero1 -t -c "SELECT merkle_root FROM test_cycles WHERE cycle_id = '$CYCLE';" | xargs)
+        
+        if [ -n "$EXPECTED_ROOT" ]; then
+            # Check all cycle artifacts
+            ARTIFACTS=$(docker compose exec -T postgres psql -U zero1 -t -c "SELECT storage_path, sha256_hash FROM artifacts_registry WHERE cycle_id = '$CYCLE';")
+            
+            while IFS='|' read -r PATH HASH; do
+                PATH=$(echo $PATH | xargs)
+                HASH=$(echo $HASH | xargs)
+                
+                # Check file hash in MinIO
+                ACTUAL_HASH=$(docker compose run --rm mc cat minio/zero1-artifacts/$PATH | sha256sum | awk '{print $1}')
+                
+                if [ "$ACTUAL_HASH" != "$HASH" ]; then
+                    echo "❌ Integrity violation: $PATH"
+                    ((INTEGRITY_ERRORS++))
+                fi
+            done <<< "$ARTIFACTS"
+        fi
+    done
+    
+    if [ $INTEGRITY_ERRORS -gt 0 ]; then
+        send_alert "data_integrity" "Integrity errors found: $INTEGRITY_ERRORS"
+    fi
+}
+
+# Security check
+check_security() {
+    echo "🔒 Security check..."
+    
+    # Check security updates
+    SECURITY_UPDATES=$(docker scout cves $(docker images -q) | grep -c "CRITICAL\|HIGH")
+    
+    if [ $SECURITY_UPDATES -gt 0 ]; then
+        send_alert "security_updates" "Critical security updates: $SECURITY_UPDATES"
+    fi
+    
+    # Check open ports
+    OPEN_PORTS=$(ss -tuln | grep -E ':(8000|9000|9001|5601|3000|9090)' | wc -l)
+    if [ $OPEN_PORTS -gt 6 ]; then
+        send_alert "open_ports" "Unexpected open ports detected"
+    fi
+}
+
+# Send alerts
+send_alert() {
+    local alert_type=$1
+    local message=$2
+    local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+    
+    echo "[$timestamp] 🚨 $message"
+    
+    # Log
+    echo "[$timestamp] $alert_type: $message" >> /var/log/zero1/alerts.log
+    
+    # Send to Slack (if configured)
+    if [ -n "$SLACK_WEBHOOK" ]; then
+        curl -X POST \
+            -H 'Content-type: application/json' \
+            --data "{\"text\":\"🚨 Project ZERO-1 Alert: $message\"}" \
+            $SLACK_WEBHOOK > /dev/null 2>&1
+    fi
+    
+    # Send email (if configured)
+    if [ -n "$ALERT_EMAIL" ]; then
+        echo "Alert: $message" | mail -s "[ZERO1] $alert_type Alert" $ALERT_EMAIL
+    fi
+}
+
+# Generate reports
+generate_report() {
+    echo "📄 Generating report..."
+    
+    REPORT_DATE=$(date +%Y-%m-%d)
+    REPORT_FILE="/var/log/zero1/reports/daily_$REPORT_DATE.md"
+    
+    cat > $REPORT_FILE << EOF
+# Project ZERO-1 Daily Report
+## Date: $REPORT_DATE
+
+### 📊 System Statistics
+- **Total cycles:** $(docker compose exec -T postgres psql -U zero1 -t -c "SELECT count(*) FROM test_cycles;")
+- **Successful cycles:** $(docker compose exec -T postgres psql -U zero1 -t -c "SELECT count(*) FROM test_cycles WHERE overall_status = 'completed';")
+- **Failed cycles:** $(docker compose exec -T postgres psql -U zero1 -t -c "SELECT count(*) FROM test_cycles WHERE overall_status = 'failed';")
+- **Active cycles:** $(docker compose exec -T postgres psql -U zero1 -t -c "SELECT count(*) FROM test_cycles WHERE overall_status = 'running';")
+
+### ⚠️  Recent Errors
+$(docker compose exec -T postgres psql -U zero1 -t -c "SELECT error_message, created_at FROM cycle_stages WHERE status = 'failed' ORDER BY created_at DESC LIMIT 5;" | sed 's/|/ | /g')
+
+### 💾 Resource Usage
+- **CPU:** ${CPU_USAGE}%
+- **Memory:** ${MEM_USAGE}%
+- **Disk:** $(df -h / | awk 'NR==2 {print $5}')
+- **Network:** $(docker stats --no-stream --format "{{.NetIO}}" | head -1)
+
+### 🔍 Recommendations
+EOF
+    
+    # Add recommendations based on metrics
+    if (( $(echo "$CPU_USAGE > 70" | bc -l) )); then
+        echo "- ⚠️  High CPU load. Scaling recommended" >> $REPORT_FILE
+    fi
+    
+    if [ $UNHEALTHY -gt 0 ]; then
+        echo "- ⚠️  Unhealthy containers detected. Intervention required" >> $REPORT_FILE
+    fi
+    
+    echo "" >> $REPORT_FILE
+    echo "*Report generated automatically*" >> $REPORT_FILE
+}
+
+# Main function
+main() {
+    echo "🔍 Starting Project ZERO-1 monitoring"
+    echo "⏰ Time: $(date)"
+    
+    # Create log directories
+    mkdir -p /var/log/zero1/{alerts,reports}
+    
+    # Execute checks
+    check_metrics
+    check_data_integrity
+    check_security
+    generate_report
+    
+    echo "✅ Monitoring completed"
+    echo "📁 Report: /var/log/zero1/reports/daily_$(date +%Y-%m-%d).md"
+}
+
+# Run via cron every 5 minutes
+if [ "$1" = "cron" ]; then
+    main >> /var/log/zero1/monitoring.log 2>&1
+else
+    main
+fi
+
+H.4. Prometheus Configuration File (prometheus.yml)
+yaml
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+rule_files:
+  - "alerts/*.yml"
+
+scrape_configs:
+  # Node Exporter
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    metrics_path: /metrics
+
+  # Docker
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+    metrics_path: /metrics
+
+  # PostgreSQL
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+    metrics_path: /metrics
+
+  # Application
+  - job_name: 'zero1-app'
+    static_configs:
+      - targets:
+        - 'zero1-controller:8000'
+        - 'ml-service:8080'
+        - 'verifier:8081'
+    metrics_path: /metrics
+    scrape_interval: 30s
+
+  # Blackbox exporter
+  - job_name: 'blackbox'
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+        - http://zero1-controller:8000/health
+        - http://ml-service:8080/health
+        - http://minio:9000/minio/health/live
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+H.5. Prometheus Alerting Rules (alerts/zero1-alerts.yml)
+yaml
+
+groups:
+  - name: zero1
+    rules:
+      # Infrastructure alerts
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: "CPU usage is {{ $value }}%"
+
+      - alert: HighMemoryUsage
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: "Memory usage is {{ $value }}%"
+
+      # Application alerts
+      - alert: HighAPILatency
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="zero1-app"}[5m])) > 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API latency"
+          description: "95th percentile latency {{ $value }}s"
+
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{job="zero1-app", status=~"5.."}[5m]) / rate(http_requests_total{job="zero1-app"}[5m]) * 100 > 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate"
+          description: "Error rate is {{ $value }}%"
+
+      # Database alerts
+      - alert: DatabaseDown
+        expr: up{job="postgres"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database unavailable"
+          description: "PostgreSQL instance is down"
+
+      - alert: HighDatabaseConnections
+        expr: pg_stat_activity_count > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High number of DB connections"
+          description: "{{ $value }} active connections"
+
+      # Storage alerts
+      - alert: MinIODown
+        expr: up{job="blackbox", instance="http://minio:9000/minio/health/live"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MinIO unavailable"
+          description: "Object storage is down"
+
+      - alert: DiskSpaceLow
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Low disk space"
+          description: "Free space is {{ $value }}%"
+
+      # Business metrics
+      - alert: HighCycleFailureRate
+        expr: rate(test_cycles_total{status="failed"}[1h]) / rate(test_cycles_total[1h]) * 100 > 10
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High cycle failure rate"
+          description: "Failure rate is {{ $value }}%"
+
+      - alert: NoCompletedCycles
+        expr: increase(test_cycles_total{status="completed"}[1h]) == 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "No completed cycles in the last hour"
+          description: "System is not processing jobs"
+
+[File Content End]

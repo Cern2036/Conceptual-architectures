@@ -1,0 +1,678 @@
+Appendix D: Detailed Database Schemas for Artifacts and Logs
+
+General Concept: To ensure integrity, performance, and ease of audit, data is divided into two logical databases:
+
+    Operational Database (Operational DB - PostgreSQL): For structured metadata, job states, and references to artifacts.
+
+    Artifact and Log Storage (Object Storage & Time-Series DB): For storing large binary and text objects (snapshots, configs, raw logs) and streaming events.
+
+D.1. Operational Database Schema (PostgreSQL 16)
+
+D.1.1. test_cycles Table
+Stores metadata for each full execution cycle.
+sql
+
+CREATE TABLE test_cycles (
+    cycle_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    stig_id VARCHAR(20) NOT NULL, -- e.g., 'V-220668'
+    target_device_model VARCHAR(50) NOT NULL, -- e.g., 'Cisco CSR1000v'
+    target_device_ip INET NOT NULL,
+    lab_snapshot_hash VARCHAR(64), -- SHA-256 of EVE-NG snapshot
+    start_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    end_time TIMESTAMPTZ,
+    overall_status VARCHAR(20) NOT NULL DEFAULT 'running' CHECK (overall_status IN ('running', 'completed', 'failed', 'rollback')),
+    merkle_root VARCHAR(64), -- Merkle Tree root of the cycle
+    digital_signature TEXT, -- Signature from YubiKey
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_cycles_status ON test_cycles(overall_status);
+CREATE INDEX idx_cycles_time ON test_cycles(start_time);
+
+D.1.2. cycle_stages Table
+Logs each execution stage for tracking and debugging.
+sql
+
+CREATE TABLE cycle_stages (
+    stage_id BIGSERIAL PRIMARY KEY,
+    cycle_id UUID NOT NULL REFERENCES test_cycles(cycle_id) ON DELETE CASCADE,
+    stage_name VARCHAR(50) NOT NULL CHECK (stage_name IN (
+        'lab_init', 'discovery', 'attack_plan', 'attack_exec',
+        'remediation_gen', 'remediation_apply', 'verification', 'report_gen'
+    )),
+    start_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    end_time TIMESTAMPTZ,
+    status VARCHAR(20) NOT NULL DEFAULT 'started' CHECK (status IN ('started', 'success', 'failed')),
+    error_message TEXT,
+    artifact_references JSONB, -- References to stage artifacts
+    CONSTRAINT fk_cycle_stage FOREIGN KEY (cycle_id) REFERENCES test_cycles(cycle_id)
+);
+CREATE INDEX idx_stages_cycle ON cycle_stages(cycle_id);
+CREATE INDEX idx_stages_name ON cycle_stages(stage_name);
+
+D.1.3. artifacts_registry Table
+Central registry of all created artifacts with cryptographic hashes.
+sql
+
+CREATE TABLE artifacts_registry (
+    artifact_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cycle_id UUID NOT NULL REFERENCES test_cycles(cycle_id) ON DELETE CASCADE,
+    stage_id BIGINT NOT NULL REFERENCES cycle_stages(stage_id),
+    artifact_type VARCHAR(30) NOT NULL CHECK (artifact_type IN (
+        'raw_config', 'parsed_config', 'llm_analysis', 'attack_plan',
+        'execution_log', 'remediation_patch', 'applied_config',
+        'verification_log', 'merkle_proof', 'final_report'
+    )),
+    storage_backend VARCHAR(20) NOT NULL DEFAULT 's3' CHECK (storage_backend IN ('s3', 'elasticsearch')),
+    storage_path TEXT NOT NULL, -- Path in S3 or ID in Elasticsearch
+    sha256_hash VARCHAR(64) NOT NULL, -- Content checksum
+    metadata JSONB, -- Additional metadata (size, MIME-type, etc.)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT unique_hash_per_cycle UNIQUE (cycle_id, sha256_hash)
+);
+CREATE INDEX idx_artifacts_cycle ON artifacts_registry(cycle_id);
+CREATE INDEX idx_artifacts_type ON artifacts_registry(artifact_type);
+CREATE INDEX idx_artifacts_hash ON artifacts_registry(sha256_hash);
+
+D.1.4. rollback_logs Table
+Detailed journal of all rollback operations.
+sql
+
+CREATE TABLE rollback_logs (
+    rollback_id BIGSERIAL PRIMARY KEY,
+    cycle_id UUID NOT NULL REFERENCES test_cycles(cycle_id),
+    triggered_by_stage VARCHAR(50) NOT NULL,
+    trigger_error TEXT NOT NULL,
+    rollback_actions JSONB NOT NULL, -- Array of performed rollback actions
+    rollback_status VARCHAR(20) NOT NULL CHECK (rollback_status IN ('success', 'partial', 'failed')),
+    start_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    end_time TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+D.2. Artifact Storage Schema (MinIO S3)
+
+An object structure is used, optimized for versioning and search:
+text
+
+s3://zero1-artifacts/
+├── cycles/
+│   ├── {cycle_id}/
+│   │   ├── 01_lab/
+│   │   │   ├── eve-ng-snapshot.qcow2
+│   │   │   └── initial-config.cfg
+│   │   ├── 02_discovery/
+│   │   │   ├── show-run-raw.txt
+│   │   │   ├── show-vlan-parsed.json
+│   │   │   └── llm-analysis.json
+│   │   ├── 03_attack/
+│   │   │   ├── attack-plan.json
+│   │   │   └── execution-log.jsonl
+│   │   ├── 04_remediation/
+│   │   │   ├── generated-patch.txt
+│   │   │   ├── backup-config.cfg
+│   │   │   └── application-log.json
+│   │   └── 05_verification/
+│   │       ├── reattack-plan.json
+│   │       └── verification-result.json
+└── proofs/
+    └── {cycle_id}/
+        ├── merkle-tree.json
+        └── signed-report.json
+
+D.3. Log and Event Storage Schema (Elasticsearch 8.11)
+
+D.3.1. Index for Structured Application Logs (zero1-app-logs-*)
+json
+
+{
+  "mappings": {
+    "properties": {
+      "@timestamp": { "type": "date" },
+      "cycle_id": { "type": "keyword" },
+      "stage": { "type": "keyword" },
+      "log_level": { "type": "keyword" },
+      "component": { "type": "keyword" },
+      "message": { "type": "text" },
+      "execution_time_ms": { "type": "long" },
+      "device_ip": { "type": "ip" },
+      "error_stack": { "type": "text" },
+      "custom_fields": { "type": "flattened" }
+    }
+  }
+}
+
+D.3.2. Index for Network Events and Telemetry (zero1-net-events-*)
+json
+
+{
+  "mappings": {
+    "properties": {
+      "@timestamp": { "type": "date" },
+      "cycle_id": { "type": "keyword" },
+      "event_type": { "type": "keyword" },
+      "src_ip": { "type": "ip" },
+      "dst_ip": { "type": "ip" },
+      "protocol": { "type": "keyword" },
+      "vlan": { "type": "keyword" },
+      "interface": { "type": "keyword" },
+      "action": { "type": "keyword" },
+      "success": { "type": "boolean" },
+      "packet_count": { "type": "long" }
+    }
+  }
+}
+
+D.3.3. Index for Kibana Alerting Rules
+Predefined rules for automatic detection:
+
+    attack-success — triggers on an event with event_type: "connectivity_test" AND success: true AND vlan: "1"
+
+    remediation-applied — triggers on event_type: "config_change" AND action: "remediation"
+
+    verification-pass — triggers if, after remediation-applied, no attack-success appears within 300 seconds.
+
+Appendix E: Complete Dockerfile and docker-compose.yml for All Services
+E.1. Base Image for Python Services (Dockerfile.python-base)
+dockerfile
+
+FROM python:3.11-slim
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    libpq-dev \
+    netcat-traditional \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Create unprivileged user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+CMD ["python", "main.py"]
+
+E.2. Cycle Controller (Dockerfile.controller)
+dockerfile
+
+FROM zero1-python-base:latest as builder
+WORKDIR /app
+COPY controller/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+FROM python:3.11-slim
+WORKDIR /app
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY controller/ .
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+E.3. ML Service for Analysis and Synthesis (Dockerfile.ml-service)
+dockerfile
+
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+WORKDIR /app
+
+# Install Python and system dependencies
+RUN apt-get update && apt-get install -y \
+    python3.11 \
+    python3.11-dev \
+    python3-pip \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy models and code
+COPY ml-service/requirements.txt .
+RUN pip3 install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Download pre-trained models
+RUN curl -L -o /app/models/llama-3.1-8b-ft.tar.gz https://storage.example.com/models/llama-3.1-8b-ft.tar.gz \
+    && tar -xzf /app/models/llama-3.1-8b-ft.tar.gz -C /app/models/ \
+    && rm /app/models/llama-3.1-8b-ft.tar.gz
+
+COPY ml-service/ .
+
+EXPOSE 8080
+CMD ["python3", "serve_models.py", "--port", "8080", "--model-dir", "/app/models"]
+
+E.4. Complete docker-compose.yml File
+yaml
+
+version: '3.8'
+
+services:
+  # Database
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: zero1
+      POSTGRES_USER: zero1
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - zero1-backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zero1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Artifact Storage
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - zero1-backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # Elastic Stack for logs
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+    volumes:
+      - elastic_data:/usr/share/elasticsearch/data
+    networks:
+      - zero1-backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  kibana:
+    image: kibana:8.11.0
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    networks:
+      - zero1-backend
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # Main Application Services
+  zero1-controller:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+    environment:
+      - DATABASE_URL=postgresql://zero1:${DB_PASSWORD}@postgres:5432/zero1
+      - MINIO_ENDPOINT=minio:9000
+      - ML_SERVICE_URL=http://ml-service:8080
+    volumes:
+      - ./config:/app/config:ro
+      - yubikey_data:/var/yubikey
+    networks:
+      - zero1-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+  ml-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.ml-service
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - MODEL_CACHE_SIZE=20
+    volumes:
+      - ./models:/app/models:ro
+    networks:
+      - zero1-backend
+
+  # Verification and log collection service
+  verifier:
+    build:
+      context: .
+      dockerfile: Dockerfile.python-base
+    environment:
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    volumes:
+      - ./verifier:/app
+    networks:
+      - zero1-backend
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - zero1-backend
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+    volumes:
+      - ./monitoring/dashboards:/etc/grafana/provisioning/dashboards
+    networks:
+      - zero1-backend
+
+volumes:
+  postgres_data:
+  minio_data:
+  elastic_data:
+  prometheus_data:
+  yubikey_data:
+
+networks:
+  zero1-backend:
+    driver: bridge
+
+Appendix F: Step-by-Step Rollback Scenarios for Each Module
+F.1. General Rollback Protocol
+
+    Error Detection: The module returns an error code > 0 or exceeds a timeout.
+
+    Logging: The error is recorded in rollback_logs with full context.
+
+    Rollback Execution: The module-specific rollback script is launched.
+
+    Verification: Success of the rollback is checked.
+
+    Escalation: If rollback fails — notify the operator and stop the cycle.
+
+F.2. Detailed Scenarios by Module
+
+F.2.1. Lab Module (Lab Manager)
+
+    Trigger: Failed to deploy the lab within 25 minutes.
+
+    Rollback Procedure:
+    bash
+
+# 1. Stop all nodes in EVE-NG
+eve-cli node stop --all --lab zero1-mvp
+
+# 2. Delete the lab
+eve-cli lab delete --name zero1-mvp --force
+
+# 3. Clean temporary files
+rm -rf /opt/eve-ng/labs/zero1-mvp
+
+# 4. Restart the EVE-NG service
+systemctl restart eve-ng
+
+# 5. Verification: check EVE-NG API availability
+curl -f http://eve-ng:8080/api/status
+
+    Success Criterion: EVE-NG API returns {"status": "ready"}.
+
+F.2.2. Attack Executor Module
+
+    Trigger: The attack caused a critical error on the target device (e.g., reboot).
+
+    Rollback Procedure:
+    bash
+
+# 1. Restore the device snapshot
+eve-cli node restore --node CSR1000v --snapshot pre-test-snapshot
+
+# 2. Reboot the device
+ssh admin@csr1000v "reload in 1\n"
+
+# 3. Wait for recovery (3 minutes)
+sleep 180
+
+# 4. Verification: check SSH availability
+nc -z -w 5 csr1000v 22
+
+    Success Criterion: The device is accessible via SSH within 5 seconds.
+
+F.2.3. Remediation Applier Module
+
+    Trigger: Applying the patch led to loss of device management.
+
+    Rollback Procedure (automatic configuration rollback):
+    bash
+
+# 1. Load the saved configuration backup
+ssh admin@csr1000v "copy tftp://backup-server/backup_pre_remediation.cfg running-config"
+
+# 2. Save the configuration
+ssh admin@csr1000v "write memory"
+
+# 3. Force reboot (if previous steps fail)
+eve-cli node reboot --node CSR1000v --force
+
+# 4. Verification: check that the port is back in VLAN 1
+OUTPUT=$(ssh admin@csr1000v "show run interface Gi2")
+echo "$OUTPUT" | grep -q "switchport access vlan 1"
+
+    Success Criterion: The interface configuration contains switchport access vlan 1.
+
+F.2.4. Evidence Generator Module
+
+    Trigger: Failed to generate a digital signature.
+
+    Rollback Procedure:
+    bash
+
+# 1. Create an unsigned report
+python generate_report.py --no-signature --output /tmp/unsigned_report.json
+
+# 2. Notify the operator
+send_alert "CRITICAL: Failed to sign report for cycle ${CYCLE_ID}"
+
+# 3. Save raw data for later analysis
+tar -czf /backup/raw_cycle_${CYCLE_ID}.tar.gz /tmp/zero1_artifacts/
+
+    Success Criterion: Unsigned report is saved, operator is notified.
+
+F.3. Rollback Escalation Matrix
+Level	Error Type	Action	Timeout
+Level 1	Temporary network error	3 retry attempts	30 seconds
+Level 2	Application error	Module rollback	5 minutes
+Level 3	Critical device error	Full lab rollback, notification	15 minutes
+Level 4	Unrecoverable error	Stop cycle, create dump for analysis	Immediately
+
+Appendix G: Pipeline Load Testing Plan
+G.1. Testing Objectives
+
+    Determine system throughput (cycles/hour).
+
+    Identify bottlenecks in the pipeline.
+
+    Determine the maximum load before service degradation.
+
+    Test stability during long-term operation (24+ hours).
+
+G.2. Methodology
+
+Using Locust for load simulation and Prometheus+Grafana for metric collection.
+
+Locust Configuration (locustfile.py):
+python
+
+from locust import HttpUser, task, between
+import uuid
+
+class ZeroOneUser(HttpUser):
+    wait_time = between(1, 3)
+    
+    @task(1)
+    def start_full_cycle(self):
+        cycle_id = str(uuid.uuid4())
+        # Start full cycle
+        self.client.post("/api/v1/cycle/start", 
+            json={
+                "cycle_id": cycle_id,
+                "target": "csr1000v-1",
+                "stig_id": "V-220668"
+            },
+            name="Start Cycle"
+        )
+        
+        # Monitor status every 30 seconds
+        for _ in range(20):  # Maximum 10 minutes wait
+            response = self.client.get(f"/api/v1/cycle/{cycle_id}/status")
+            if response.json()["status"] in ["completed", "failed"]:
+                break
+            time.sleep(30)
+    
+    @task(3)
+    def start_analysis_only(self):
+        # Testing only the analysis phase
+        self.client.post("/api/v1/attack/analyze",
+            json={"target": "csr1000v-2"},
+            name="Analyze Only"
+        )
+
+G.3. Load Testing Stages
+
+Stage 1: Baseline Testing (1 hour)
+
+    Load: 1 cycle every 10 minutes
+
+    Metrics:
+
+        Execution time of each stage
+
+        CPU/GPU usage
+
+        Memory consumption
+
+        Network load
+
+Stage 2: Gradual Load Increase (4 hours)
+yaml
+
+Load Scenarios:
+  1st hour: 5 cycles/hour
+  2nd hour: 10 cycles/hour  
+  3rd hour: 20 cycles/hour
+  4th hour: 30 cycles/hour
+
+    Goal: Find the point where response time increases by 50%
+
+Stage 3: Peak Load (2 hours)
+
+    Load: 50 cycles/hour (maximum theoretical throughput)
+
+    Monitoring:
+
+        PostgreSQL queues
+
+        Elasticsearch delays
+
+        Timeout errors
+
+Stage 4: Endurance (24 hours)
+
+    Load: 15 cycles/hour (stable level)
+
+    Goal: Check for memory leaks, disk fragmentation, log accumulation
+
+G.4. Key Metrics and Target Values
+yaml
+
+Performance Metrics:
+  p95_cycle: < 90 minutes  # 95th percentile
+  p99_analysis: < 120 seconds
+  success_rate_cycles: > 95%
+  gpu_utilization: < 80%
+  ram_utilization: < 85%
+  db_latency: < 100 ms
+
+Reliability Metrics:
+  timeout_errors: < 1%
+  auto_rollbacks: < 5%
+  lost_artifacts: 0
+
+G.5. Monitoring Tools
+
+    Infrastructure: node_exporter on all hosts.
+
+    Database: postgres_exporter.
+
+    Application: Custom Prometheus metrics in each module.
+
+    Logs: Centralized collection in Elasticsearch.
+
+    Dashboards:
+
+        System Overview
+
+        Cycle Details
+
+        Error Analysis
+
+G.6. Load Test Success Criteria
+
+    The system handles 15 cycles/hour without service degradation.
+
+    95% of cycles complete successfully.
+
+    Automatic rollbacks trigger for less than 5% of operations.
+
+    Recovery time after a failure is < 10 minutes.
+
+    Memory consumption is stable for 24 hours.
+
+G.7. Action Plan Based on Test Results
+text
+
+graph TD
+    A[Start Load Testing] --> B{Analyze Results};
+    B --> C[Stage 1: Database<br/>Scaling];
+    B --> D[Stage 2: Optimizing<br/>LLM Queries];
+    B --> E[Stage 3: Improving<br/>Caching];
+    
+    C --> C1[Add PostgreSQL<br/>Replicas];
+    C --> C2[Shard<br/>Artifacts];
+    
+    D --> D1[Optimize Prompts];
+    D --> D2[Cache LLM<br/>Results];
+    
+    E --> E1[Cache Device<br/>Configurations];
+    E --> E2[Pre-load<br/>Models];
+    
+    C1 --> F[Re-test];
+    D1 --> F;
+    E1 --> F;
+    
+    F --> G{Goals Met?};
+    G -->|Yes| H[Ready for Production];
+    G -->|No| B;
+
+Note: All tests are performed on an isolated stand identical to production, but without access to real network devices. 10 virtual CSR1000v devices are used to simulate various targets.
+
+[File Content End]

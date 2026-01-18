@@ -1,0 +1,965 @@
+Appendix I: Disaster Recovery Plans
+I.1. Incident Classification
+Level	Description	Recovery Time Objective (RTO)	Recovery Point Objective (RPO)
+Level 1	Partial service degradation (1-2 containers)	≤ 15 minutes	0 minutes (hot standby)
+Level 2	Loss of one critical service (DB, MinIO, Elasticsearch)	≤ 1 hour	5 minutes (replication)
+Level 3	Complete system loss (host failure, datacenter outage)	≤ 4 hours	1 hour (hourly snapshots)
+Level 4	Catastrophic failure (data loss, compromise)	≤ 24 hours	24 hours (daily backups)
+
+I.2. Recovery Procedures by Level
+
+I.2.1. Level 1 Recovery (Partial Degradation)
+bash
+
+#!/bin/bash
+# recovery-level1.sh
+
+echo "🔧 Level 1 Recovery: Partial Degradation"
+
+# 1. Identify problematic service
+FAILED_SERVICES=$(docker ps --filter "health=unhealthy" --format "{{.Names}}")
+
+for SERVICE in $FAILED_SERVICES; do
+    echo "🔄 Restarting $SERVICE..."
+    
+    # 2. Save logs before restart
+    docker logs $SERVICE > /tmp/${SERVICE}_crash.log 2>&1
+    
+    # 3. Restart with increased resources
+    docker compose restart $SERVICE
+    
+    # 4. Monitor recovery
+    timeout 120 bash -c "
+        while ! docker ps --filter 'name=$SERVICE' --filter 'health=healthy' | grep -q $SERVICE; do
+            sleep 5
+            echo -n '.'
+        done
+    "
+    
+    if [ $? -eq 0 ]; then
+        echo "✅ $SERVICE recovered"
+    else
+        echo "❌ $SERVICE not recovered, escalating to level 2"
+        escalate_to_level2 $SERVICE
+    fi
+done
+
+# 5. Check integration
+echo "🔍 Checking service integration..."
+curl -f http://localhost:8000/api/v1/health || escalate_to_level2 "controller"
+curl -f http://localhost:8080/health || escalate_to_level2 "ml-service"
+
+echo "✅ Level 1 recovery completed"
+
+I.2.2. Level 2 Recovery (Critical Service Loss)
+bash
+
+#!/bin/bash
+# recovery-level2.sh
+
+SERVICE=$1
+BACKUP_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+echo "🚨 Level 2 Recovery: Loss of $SERVICE"
+
+case $SERVICE in
+    postgres)
+        echo "🗄️  Restoring PostgreSQL..."
+        
+        # 1. Stop service
+        docker compose stop postgres
+        
+        # 2. Restore from latest snapshot
+        SNAPSHOT=$(ls -t /backups/postgres/*.snapshot | head -1)
+        
+        # 3. Restore data
+        docker run --rm \
+            -v ${PROJECT_NAME}_postgres_data:/restore \
+            -v $(dirname $SNAPSHOT):/backup \
+            alpine sh -c "rm -rf /restore/* && tar xzf /backup/$(basename $SNAPSHOT) -C /restore"
+        
+        # 4. Start with integrity check
+        docker compose up -d postgres
+        
+        # 5. Verify recovery
+        timeout 300 bash -c '
+            while ! docker compose exec -T postgres pg_isready -U zero1; do
+                sleep 10
+            done
+        '
+        
+        # 6. Verify data
+        docker compose exec -T postgres psql -U zero1 -d zero1 -c "SELECT COUNT(*) FROM test_cycles;" || {
+            echo "❌ Data recovery error"
+            escalate_to_level3 "postgres_data_corrupt"
+        }
+        ;;
+        
+    minio)
+        echo "🪣 Restoring MinIO..."
+        
+        # MinIO supports automatic replication
+        # Switch to standby instance
+        docker compose stop minio
+        docker compose up -d minio-standby
+        
+        # Update endpoint in all services
+        update_service_endpoint "MINIO_ENDPOINT" "minio-standby:9000"
+        ;;
+        
+    elasticsearch)
+        echo "🔍 Restoring Elasticsearch..."
+        
+        # 1. Stop cluster
+        docker compose stop elasticsearch kibana
+        
+        # 2. Restore from repository snapshot
+        docker compose run --rm elasticsearch \
+            curl -X POST "localhost:9200/_snapshot/backup_repo/snapshot_$(date +%Y%m%d)/_restore?wait_for_completion=true"
+        
+        # 3. Restart
+        docker compose up -d elasticsearch kibana
+        
+        # 4. Verify
+        curl -f http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5m
+        ;;
+        
+    *)
+        echo "⚠️  Unknown service: $SERVICE"
+        escalate_to_level3 "unknown_service_failure"
+        ;;
+esac
+
+echo "✅ $SERVICE recovery completed"
+
+I.2.3. Level 3 Recovery (Complete System Loss)
+bash
+
+#!/bin/bash
+# recovery-level3.sh
+
+DISASTER_TYPE=$1
+RECOVERY_POINT=$2
+
+echo "💥 Level 3 Recovery: $DISASTER_TYPE"
+
+# 1. Activate DR site
+activate_dr_site() {
+    echo "🌐 Activating DR site..."
+    
+    # DNS switchover
+    aws route53 change-resource-record-sets \
+        --hosted-zone-id Z123456789 \
+        --change-batch '{
+            "Changes": [{
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                    "Name": "zero1-api.example.com",
+                    "Type": "A",
+                    "TTL": 60,
+                    "ResourceRecords": [{"Value": "192.168.100.100"}]
+                }
+            }]
+        }'
+    
+    # Start infrastructure at DR site
+    ssh dr-site-manager "cd /opt/zero1 && ./deploy.sh production dr"
+}
+
+# 2. Restore from backup
+restore_from_backup() {
+    local backup_file=$1
+    
+    echo "💾 Restoring from backup: $backup_file"
+    
+    # Download backup
+    aws s3 cp s3://zero1-dr-backups/$backup_file /tmp/recovery.tar.gz
+    
+    # Extract
+    tar xzf /tmp/recovery.tar.gz -C /opt/zero1-recovery
+    
+    # Restore configuration
+    cp -r /opt/zero1-recovery/config/* /opt/zero1/config/
+    cp /opt/zero1-recovery/.env /opt/zero1/
+    
+    # Restore volumes
+    restore_volumes /opt/zero1-recovery/volumes/
+}
+
+# 3. Procedures for different disaster types
+case $DISASTER_TYPE in
+    "host_failure")
+        echo "🖥️  Recovering from host failure..."
+        
+        # Start on backup hardware
+        migrate_to_backup_host
+        
+        # Restore from last snapshot
+        restore_from_backup "hourly_$(date +%Y%m%d_%H).tar.gz"
+        ;;
+        
+    "datacenter_outage")
+        echo "🏢 Recovering from datacenter outage..."
+        
+        activate_dr_site
+        
+        # Restore from last available backup
+        LAST_BACKUP=$(aws s3 ls s3://zero1-dr-backups/ | grep daily | tail -1 | awk '{print $4}')
+        restore_from_backup $LAST_BACKUP
+        ;;
+        
+    "data_corruption")
+        echo "📛 Recovering from data corruption..."
+        
+        # Stop all services
+        docker compose down
+        
+        # Find last clean backup
+        find_clean_backup $RECOVERY_POINT
+        
+        # Full restore
+        restore_from_backup $CLEAN_BACKUP
+        
+        # Validate data
+        validate_recovered_data
+        ;;
+        
+    "security_breach")
+        echo "🔒 Recovering from security breach..."
+        
+        # 1. Isolate system
+        iptables -A INPUT -j DROP
+        
+        # 2. Create clean environment
+        setup_clean_environment
+        
+        # 3. Restore from trusted backup
+        restore_from_backup "verified_$(date -d '7 days ago' +%Y%m%d).tar.gz"
+        
+        # 4. Rotate all keys and certificates
+        rotate_all_secrets
+        
+        # 5. Audit recovered system
+        security_audit_recovered
+        ;;
+esac
+
+# 4. Start system
+echo "🚀 Starting recovered system..."
+docker compose up -d
+
+# 5. Validate
+echo "🔍 Validating recovery..."
+run_recovery_validation
+
+echo "✅ Level 3 recovery completed"
+
+I.3. Regular Backup Procedures
+
+I.3.1. Hourly Snapshots
+bash
+
+#!/bin/bash
+# backup-hourly.sh
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_DIR="/backups/hourly/$TIMESTAMP"
+
+echo "💾 Creating hourly snapshot..."
+
+# 1. PostgreSQL snapshot
+docker compose exec -T postgres pg_dumpall -U zero1 | gzip > $BACKUP_DIR/postgres_full.sql.gz
+
+# 2. MinIO data snapshot
+docker compose run --rm mc mirror minio/zero1-artifacts $BACKUP_DIR/minio/
+
+# 3. Configuration snapshot
+cp -r /opt/zero1/config $BACKUP_DIR/
+cp /opt/zero1/.env $BACKUP_DIR/
+
+# 4. Create checksum
+find $BACKUP_DIR -type f -exec sha256sum {} \; > $BACKUP_DIR/checksums.sha256
+
+# 5. Send to remote storage
+aws s3 sync $BACKUP_DIR s3://zero1-backups/hourly/$TIMESTAMP/
+
+# 6. Cleanup old backups (keep 24 hours)
+find /backups/hourly/* -mmin +1440 -exec rm -rf {} \;
+
+echo "✅ Hourly snapshot created: $BACKUP_DIR"
+
+I.3.2. Daily Full Backups
+bash
+
+#!/bin/bash
+# backup-daily.sh
+
+TIMESTAMP=$(date +%Y%m%d)
+BACKUP_DIR="/backups/daily/$TIMESTAMP"
+
+echo "💿 Creating daily full backup..."
+
+# 1. Stop applications (graceful)
+docker compose stop zero1-controller verifier scheduler worker
+
+# 2. Full Docker volumes snapshot
+docker run --rm \
+    -v ${PROJECT_NAME}_postgres_data:/source_db:ro \
+    -v ${PROJECT_NAME}_minio_data:/source_minio:ro \
+    -v ${PROJECT_NAME}_elasticsearch_data:/source_es:ro \
+    -v $BACKUP_DIR:/backup \
+    alpine tar czf /backup/full_system_$TIMESTAMP.tar.gz -C / .
+
+# 3. Elasticsearch indices snapshot
+curl -X PUT "localhost:9200/_snapshot/backup_repo/snapshot_$TIMESTAMP?wait_for_completion=true"
+
+# 4. Record system state
+docker info > $BACKUP_DIR/system_state.txt
+docker compose config > $BACKUP_DIR/compose_state.yml
+
+# 5. Start applications
+docker compose start zero1-controller verifier scheduler worker
+
+# 6. Encrypt and send
+gpg --encrypt --recipient backup@zero1.io $BACKUP_DIR/full_system_$TIMESTAMP.tar.gz
+aws s3 cp $BACKUP_DIR/full_system_$TIMESTAMP.tar.gz.gpg s3://zero1-dr-backups/daily/
+
+# 7. Rotation (keep 30 days)
+find /backups/daily/* -mtime +30 -exec rm -rf {} \;
+
+echo "✅ Daily backup created: $BACKUP_DIR"
+
+I.4. Recovery Testing
+
+I.4.1. Quarterly DR Drills
+yaml
+
+# dr-test-scenario.yml
+scenarios:
+  - name: "Complete Datacenter Loss"
+    steps:
+      - step: "Simulate failure"
+        action: "simulate_datacenter_outage.sh"
+        
+      - step: "Activate DR site"
+        action: "activate_dr_site.sh"
+        timeout: "1h"
+        
+      - step: "Restore from backup"
+        action: "restore_from_backup.sh --point 24h"
+        timeout: "2h"
+        
+      - step: "Verify functionality"
+        action: "run_dr_validation.sh"
+        metrics:
+          - "api_response_time < 5s"
+          - "data_integrity = 100%"
+          - "no_data_loss"
+          
+  - name: "Database Corruption"
+    steps:
+      - step: "Simulate corruption"
+        action: "corrupt_postgres_tables.sh"
+        
+      - step: "Detect problem"
+        action: "detect_corruption.sh"
+        timeout: "15m"
+        
+      - step: "Recover transactions"
+        action: "recover_from_wal.sh"
+        timeout: "30m"
+        
+      - step: "Validate"
+        action: "validate_recovery.sh"
+
+I.4.2. Recovery Success Metrics
+bash
+
+#!/bin/bash
+# dr-metrics.sh
+
+echo "📊 Recovery metrics:"
+
+# 1. Recovery Time Objective (RTO)
+START_TIME=$(cat /tmp/dr_start_time)
+END_TIME=$(date +%s)
+RTO=$((END_TIME - START_TIME))
+
+echo "🕒 RTO: $RTO seconds"
+echo "   Target: < 4 hours (14400 seconds)"
+
+if [ $RTO -lt 14400 ]; then
+    echo "   ✅ Within target"
+else
+    echo "   ❌ Exceeded"
+fi
+
+# 2. Recovery Point Objective (RPO)
+LAST_BACKUP_TIME=$(aws s3 ls s3://zero1-backups/daily/ | tail -1 | awk '{print $1" "$2}')
+LAST_BACKUP_TS=$(date -d "$LAST_BACKUP_TIME" +%s)
+FAILURE_TIME=$(cat /tmp/failure_time)
+RPO=$((FAILURE_TIME - LAST_BACKUP_TS))
+
+echo "💾 RPO: $RPO seconds"
+echo "   Target: < 1 hour (3600 seconds)"
+
+if [ $RPO -lt 3600 ]; then
+    echo "   ✅ Within target"
+else
+    echo "   ❌ Exceeded"
+fi
+
+# 3. Data integrity
+DATA_INTEGRITY=$(check_data_integrity | grep "Integrity check passed" | wc -l)
+
+echo "🔍 Data integrity:"
+if [ $DATA_INTEGRITY -eq 1 ]; then
+    echo "   ✅ 100% integrity"
+else
+    echo "   ❌ Integrity compromised"
+fi
+
+# 4. Service availability
+SERVICES_TOTAL=$(docker compose ps --services | wc -l)
+SERVICES_HEALTHY=$(docker compose ps --services --filter "status=running" | wc -l)
+AVAILABILITY=$((SERVICES_HEALTHY * 100 / SERVICES_TOTAL))
+
+echo "🌐 Service availability: $AVAILABILITY%"
+echo "   Target: > 99.9%"
+
+# 5. Generate report
+generate_dr_report $RTO $RPO $DATA_INTEGRITY $AVAILABILITY
+
+Appendix J: Complete API Documentation
+J.1. OpenAPI Specification for Main Controller
+yaml
+
+openapi: 3.0.3
+info:
+  title: Project ZERO-1 API
+  version: 1.0.0
+  description: API for managing autonomous security verification cycles
+
+servers:
+  - url: http://localhost:8000/api/v1
+    description: Local development server
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      
+  schemas:
+    Cycle:
+      type: object
+      required:
+        - cycle_id
+        - stig_id
+        - target_device
+      properties:
+        cycle_id:
+          type: string
+          format: uuid
+          example: "123e4567-e89b-12d3-a456-426614174000"
+        stig_id:
+          type: string
+          example: "V-220668"
+        target_device:
+          $ref: '#/components/schemas/Device'
+        status:
+          type: string
+          enum: [pending, running, completed, failed, rollback]
+        created_at:
+          type: string
+          format: date-time
+        artifacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Artifact'
+            
+    Device:
+      type: object
+      properties:
+        ip_address:
+          type: string
+          format: ipv4
+        model:
+          type: string
+        credentials_ref:
+          type: string
+          description: Reference to secret in Vault
+          
+    Artifact:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [config, log, report, proof]
+        storage_path:
+          type: string
+        sha256:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+paths:
+  /cycles:
+    post:
+      summary: Start new verification cycle
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - stig_id
+                - target_device
+              properties:
+                stig_id:
+                  type: string
+                target_device:
+                  $ref: '#/components/schemas/Device'
+                priority:
+                  type: string
+                  enum: [low, normal, high]
+                  default: normal
+      responses:
+        '202':
+          description: Cycle accepted for processing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cycle_id:
+                    type: string
+                    format: uuid
+                  status_url:
+                    type: string
+                    example: "/api/v1/cycles/{cycle_id}/status"
+                    
+  /cycles/{cycle_id}:
+    get:
+      summary: Get cycle information
+      parameters:
+        - name: cycle_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Cycle information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cycle'
+                
+    delete:
+      summary: Cancel cycle
+      parameters:
+        - name: cycle_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '202':
+          description: Cycle canceled
+          
+  /cycles/{cycle_id}/status:
+    get:
+      summary: Get cycle status
+      parameters:
+        - name: cycle_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Cycle status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  current_stage:
+                    type: string
+                  progress:
+                    type: number
+                    minimum: 0
+                    maximum: 100
+                  estimated_completion:
+                    type: string
+                    format: date-time
+                    
+  /cycles/{cycle_id}/artifacts:
+    get:
+      summary: Get cycle artifacts
+      parameters:
+        - name: cycle_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: artifact_type
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of artifacts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Artifact'
+                  
+  /cycles/{cycle_id}/report:
+    get:
+      summary: Get final report
+      parameters:
+        - name: cycle_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Final report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cycle_id:
+                    type: string
+                  verification_result:
+                    type: boolean
+                  merkle_root:
+                    type: string
+                  digital_signature:
+                    type: string
+                  artifacts_summary:
+                    type: object
+                    
+  /health:
+    get:
+      summary: System health check
+      responses:
+        '200':
+          description: System status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [healthy, degraded, unhealthy]
+                  components:
+                    type: object
+                  uptime:
+                    type: number
+                  timestamp:
+                    type: string
+                    format: date-time
+                    
+  /metrics:
+    get:
+      summary: System metrics
+      responses:
+        '200':
+          description: Metrics in Prometheus format
+          
+  /admin/backup:
+    post:
+      summary: Initiate manual backup
+      security:
+        - bearerAuth: []
+      responses:
+        '202':
+          description: Backup started
+          
+  /admin/restore:
+    post:
+      summary: Restore from backup
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - backup_id
+              properties:
+                backup_id:
+                  type: string
+                validate_only:
+                  type: boolean
+                  default: false
+      responses:
+        '202':
+          description: Restoration started
+
+J.2. API for ML Service
+yaml
+
+openapi: 3.0.3
+info:
+  title: ZERO-1 ML Service API
+  version: 1.0.0
+
+paths:
+  /analyze:
+    post:
+      summary: Analyze device configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - device_config
+                - stig_reference
+              properties:
+                device_config:
+                  type: object
+                  description: Structured device configuration
+                stig_reference:
+                  type: string
+                  description: STIG check ID
+                context:
+                  type: object
+                  description: Additional context
+      responses:
+        '200':
+          description: Analysis result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  findings:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Finding'
+                  attack_plan:
+                    $ref: '#/components/schemas/AttackPlan'
+                  confidence:
+                    type: number
+                    minimum: 0
+                    maximum: 1
+                    
+  /remediate:
+    post:
+      summary: Generate remediation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - finding
+                - device_config
+              properties:
+                finding:
+                  $ref: '#/components/schemas/Finding'
+                device_config:
+                  type: object
+                constraints:
+                  type: object
+                  properties:
+                    allowed_commands:
+                      type: array
+                      items:
+                        type: string
+                    maintenance_window:
+                      type: object
+      responses:
+        '200':
+          description: Generated remediation
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  remediation:
+                    type: array
+                    items:
+                      type: string
+                  validation_script:
+                    type: string
+                  rollback_commands:
+                    type: array
+                    items:
+                      type: string
+                  estimated_risk:
+                    type: string
+                    enum: [low, medium, high]
+
+  /models:
+    get:
+      summary: List available models
+      responses:
+        '200':
+          description: List of models
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  models:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ModelInfo'
+                  
+  /models/{model_id}/fine-tune:
+    post:
+      summary: Fine-tune model
+      parameters:
+        - name: model_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                dataset:
+                  type: string
+                  format: binary
+                parameters:
+                  type: object
+      responses:
+        '202':
+          description: Fine-tuning started
+          
+components:
+  schemas:
+    Finding:
+      type: object
+      properties:
+        stig_id:
+          type: string
+        description:
+          type: string
+        severity:
+          type: string
+          enum: [low, medium, high, critical]
+        affected_components:
+          type: array
+          items:
+            type: string
+            
+    AttackPlan:
+      type: object
+      properties:
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/AttackStep'
+        estimated_success_rate:
+          type: number
+          
+    AttackStep:
+      type: object
+      properties:
+        technique_id:
+          type: string
+        command:
+          type: string
+        prerequisites:
+          type: array
+          items:
+            type: string
+            
+    ModelInfo:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+          enum: [analyzer, remediator]
+        version:
+          type: string
+        accuracy:
+          type: number
+
+J.3. WebSocket API for Real-Time Updates
+javascript
+
+// WebSocket connection for progress tracking
+const ws = new WebSocket('ws://localhost:8000/ws/cycles');
+
+ws.onopen = () => {
+    // Subscribe to cycle events
+    ws.send(JSON.stringify({
+        action: 'subscribe',
+        cycle_id: '123e4567-e89b-12d3-a456-426614174000'
+    }));
+};
+
+ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    
+    switch(data.type) {
+        case 'stage_update':
+            console.log(`Stage: ${data.stage}, Progress: ${data.progress}%`);
+            break;
+            
+        case 'artifact_created':
+            console.log(`Artifact created: ${data.artifact_type}`);
+            break;
+            
+        case 'verification_result':
+            console.log(`Verification result: ${data.success ? 'Success' : 'Failure'}`);
+            break;
+            
+        case 'error':
+            console.error(`Error: ${data.message}`);
+            break;
+    }
+};
+
+// Available events
+const WS_EVENTS = {
+    CYCLE_STARTED: 'cycle_started',
+    STAGE_STARTED: 'stage_started',
+    STAGE_COMPLETED: 'stage_completed',
+    ARTIFACT_CREATED: 'artifact_created',
+    VERIFICATION_RESULT: 'verification_result',
+    CYCLE_COMPLETED: 'cycle_completed',
+    ERROR_OCCURRED: 'error'
+};
+
+[File Content End]

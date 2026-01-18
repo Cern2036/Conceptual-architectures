@@ -1,0 +1,678 @@
+Technical Specification
+
+Project ZERO-1: Prototype of an Autonomous Coevolutionary Hardening Loop for Network Equipment
+
+Version: 1.0
+Date: December 21, 2025
+Framework Developer: E. Veles
+
+1. INTRODUCTION AND PROJECT GOALS
+
+1.1. Context and Justification.
+The modern process of auditing and hardening network equipment (Cisco, Juniper) configurations in accordance with security profiles (DISA STIG, CIS Benchmarks) is predominantly manual. This leads to the following problems:
+
+    High Cost: Requires hiring highly paid network and security analyst experts.
+
+    Low Speed: Manual verification of thousands of configuration lines takes days and weeks.
+
+    Human Factor: High probability of missing errors due to fatigue or inattention.
+
+    Complex Verification: Lack of technically irrefutable proof that a found issue was corrected properly.
+
+Project ZERO-1 aims to demonstrate the possibility of automating this process by creating a prototype that implements one closed loop.
+
+1.2. MVP Goal.
+Develop and demonstrate a working prototype of a software-hardware complex that, in a fully automatic mode, performs a full cycle of actions for one specified configuration vulnerability of Cisco IOS XE network equipment:
+
+    Discovery: Autonomous analysis of the device configuration for compliance with the DISA STIG standard.
+
+    Exploitation: Automatic verification of the exploitability of the found vulnerability to prove its criticality.
+
+    Remediation Synthesis: Automatic generation of a correct configuration patch based on the analysis of a successful attack.
+
+    Verification: Automatic application of the patch and repeated testing to confirm its effectiveness.
+
+    Evidence Generation: Creation of a cryptographically verifiable report containing the complete chain of actions and their results.
+
+1.3. Key Differences from Existing Solutions.
+Tool / Approach	Principle of Operation	Limitation	ZERO-1 Solution
+Static Analyzers (Nipper, Nessus)	Passive parsing of a configuration file.	Cannot check the exploitability of a finding. Do not generate a ready-made fix.	Active proof of vulnerability through attack simulation and automatic patch generation.
+Manual Penetration Testing	An expert manually conducts reconnaissance, exploitation, and analysis.	Does not scale, depends on expert qualification, subjective.	Full automation of the cycle, eliminating the human factor at the execution stage.
+Configuration Managers (Ansible, Terraform)	Apply a predefined "desired" state.	Require this state to be known in advance and correctly described by an expert.	Autonomous discovery of deviations from the standard and synthesis of a desired state for a specific found deviation.
+
+1.4. Definition of Success for MVP.
+The project is considered successful if the developed prototype, in three consecutive fully automatic runs (without operator intervention after start), demonstrates the following results:
+
+    Cycle 1: Discovery of vulnerability V-220668 -> Successful demonstration of its exploitation -> Correct generation of a patch -> Successful application -> Confirmation of vulnerability blocking upon re-check -> Formation of a valid evidence report.
+
+    Cycles 2 and 3: Stable repetition of Cycle 1 results with identical metrics.
+
+    Total execution time of one full cycle does not exceed 120 minutes.
+
+2. TARGET VULNERABILITY SELECTION AND TEST ENVIRONMENT
+
+2.1. Vulnerability Selection Justification.
+For the MVP, violation of DISA STIG ID V-220668 from the profile for Cisco IOS XE Switch L2S (version 3, release dated 19.05.2025) has been selected.
+
+    Formulation: "The Cisco switch must not have the default VLAN assigned to any host-facing access ports."
+
+    Technical Essence: Having a port in access mode assigned to VLAN 1 (default VLAN) is a common mistake. This simplifies attacks like VLAN Hopping (Double Tagging) and expands the attack zone in case of compromise of any device in VLAN 1.
+
+    Reasons for MVP Selection:
+
+        Clear Identification: The vulnerability is easily identified by the commands show run interface and show vlan.
+
+        Simplicity of Exploitation: The fact of vulnerability can be proven by a simple network connectivity check (ICMP, TCP) to the target host in VLAN 1.
+
+        Unambiguous Fix: Fixed by a strictly defined sequence of IOS commands (moving the port to a non-zero VLAN).
+
+        High Prevalence: A typical finding in real audits.
+
+2.2. Test Lab Environment Specification.
+The environment must be completely isolated from production networks and reproducible "with one click".
+
+2.2.1. Physical and Virtual Infrastructure.
+
+    Host Server: Dedicated server or powerful virtual machine.
+
+        CPU: 16 cores (Intel Xeon Silver 4314 / AMD EPYC 7313).
+
+        RAM: 128 GB DDR4 ECC.
+
+        GPU: 1x NVIDIA RTX A6000 (48 GB) or 2x NVIDIA RTX 4090 (24 GB) for simultaneous inference of two LLM models.
+
+        Storage: 2 TB NVMe SSD (RAID 1).
+
+        Network Card: 2x 10 GbE (one for management, one for isolated stand).
+
+    Host Software Platform:
+
+        OS: Ubuntu Server 22.04.3 LTS.
+
+        Hypervisor: VMware ESXi 8.0 U2 (or KVM/QEMU if using bare-metal).
+
+        Network Emulation Platform: EVE-NG Professional 5.0-1-26. Chosen for professional Cisco image support, stability, and API integration capabilities.
+
+        Containerization: Docker 24.0.7, Docker Compose v2.23.3.
+
+        Management: Python 3.11.7, Ansible Core 2.16.4, Terraform 1.6.6.
+
+2.2.2. Virtual Test Network (EVE-NG Lab).
+A "Star" topology is created:
+text
+
+[Attacker Host (Ubuntu)] ----- [Cisco CSR1000v] ----- [Target Server (Ubuntu in VLAN 1)]
+       (Management Net)                 (Lab Network)                     (Lab Network)
+
+Network Equipment:
+
+    Model: Cisco Cloud Services Router (CSR) 1000V.
+
+    Software Version: IOS XE 17.09.04a (VIRL-17.09.04a).
+
+    Configuration (initial, vulnerable):
+    cisco
+
+hostname ZERO1-TARGET-SWITCH
+!
+vlan 100
+ name REMEDIATION_VLAN
+!
+interface GigabitEthernet1
+ description TO_ATTACKER_HOST
+ no ip address
+ negotiation auto
+ no cdp enable
+!
+interface GigabitEthernet2
+ description TO_TARGET_SERVER
+ switchport mode access
+ switchport access vlan 1  <--- STIG VIOLATION V-220668
+ negotiation auto
+ no cdp enable
+!
+interface Vlan1
+ ip address 192.168.1.1 255.255.255.0
+!
+interface Vlan100
+ ip address 192.168.100.1 255.255.255.0
+!
+ip route 0.0.0.0 0.0.0.0 192.168.1.254
+line vty 0 4
+ password cisco
+ login local
+
+Hosts in the Lab:
+
+    Attacker Host (Attacker): Ubuntu 22.04 virtual machine. Assigned an IP in the EVE-NG management network (e.g., 192.168.255.10). All control scripts and ZERO-1 project agents run on it.
+
+    Target Server (Target): Ubuntu 22.04 virtual machine. Assigned IP 192.168.1.100 in VLAN 1. A simple HTTP server (nginx) is running on the server, and responses to ICMP requests are allowed. Serves as an indicator of successful exploitation.
+
+2.2.3. Deployment Automation.
+The entire lab is described as code (Infrastructure as Code).
+
+    Terraform: The main tool. A custom provider for the EVE-NG API is used (or management via ssh and expect scripts). Configuration (main.tf) defines:
+
+        Creation of a new project zero1-mvp.
+
+        Adding nodes (CSR1000v, Ubuntu VMs).
+
+        Creating network connections.
+
+        Starting nodes.
+
+    Ansible: Used for post-deploy configuration:
+
+        Loading the initial vulnerable configuration onto the CSR1000v.
+
+        Configuring IP addresses and services on Ubuntu virtual machines.
+
+        Installing and configuring monitoring agents.
+
+Result: The operator runs terraform apply and receives a ready-to-use, reproducible test environment in 15-20 minutes.
+
+3. DETAILED COMPONENT ARCHITECTURE
+
+The system is built on a modular principle. The central orchestrator is the Cycle Controller, which calls specialized modules through strictly defined APIs.
+
+3.1. Cycle Controller.
+
+    Implementation: Python 3.11 microservice using FastAPI.
+
+    Functions:
+
+        Orchestration: Sequential call of other modules according to the workflow.
+
+        State Management: Tracking the current stage, error handling, implementing a simple finite-state machine.
+
+        Stand Management: Calling Terraform/Ansible for environment initialization, snapshots, and rollback.
+
+        Artifact Collection: Aggregation of output data from all modules (logs, configs, LLM reports).
+
+        Summary Formation: Generation of the final evidence report and its cryptographic signing.
+
+    API Endpoints (internal):
+
+        POST /api/v1/lab/init -> Start lab deployment.
+
+        POST /api/v1/attack/analyze -> Start Attack Analyst module.
+
+        POST /api/v1/attack/execute -> Start Attack Executor module.
+
+        POST /api/v1/remediation/generate -> Start Remediation Synthesizer module.
+
+        POST /api/v1/remediation/apply -> Start Remediation Applier module.
+
+        POST /api/v1/verify -> Start verification module.
+
+        GET /api/v1/report -> Get final report.
+
+3.2. Attack Analyst Module.
+
+    Purpose: Establish an SSH session to the target switch, collect data (show running-config, show vlan brief, show interfaces status), analyze it for violation V-220668, and formulate a verification plan (Proof-of-Concept).
+
+    Architecture:
+
+        Data Collector: Uses the Netmiko 4.2.0 library. Executes a sequence of commands, saves raw output.
+
+        Parser: Uses TextFSM with NTC Templates to convert CLI text output into structured JSON. Example parser output for show vlan brief:
+        json
+
+{
+  "vlans": [
+    {"vlan_id": "1", "name": "default", "status": "active", "ports": ["Gi2"]},
+    {"vlan_id": "100", "name": "REMEDIATION_VLAN", "status": "active", "ports": []}
+  ]
+}
+
+Analytics Core: Fine-tuned language model Llama-3.1-8B-Instruct.
+
+    Dataset for fine-tuning: 5000+ examples like:
+
+json
+
+{
+  "input": "Structured JSON data from parser (show run, show vlan). Reference: STIG V-220668.",
+  "output": "{\"findings\": [{\"stig_id\": \"V-220668\", \"description\": \"Access port Gi2 is in default VLAN 1.\", \"severity\": \"medium\"}], \"attack_plan\": {\"goal\": \"Prove connectivity to target in VLAN 1.\", \"steps\": [{\"type\": \"connectivity_check\", \"tool\": \"ping\", \"target\": \"192.168.1.100\"}]}}"
+}
+
+    Inference: Uses the vLLM framework for high performance. Prompt template:
+
+text
+
+You are a network security audit expert. Analyze the provided Cisco IOS switch configuration.
+Identify violations of the DISA STIG standard. Focus on V-220668.
+For each violation, propose a simple PoC plan to demonstrate the vulnerability.
+Configuration: {structured_data_from_parser}
+
+        Output Validator: The JSON received from the LLM is checked for compliance with a predefined schema (using the jsonschema library). If it doesn't match, an error occurs and the cycle stops.
+
+3.3. Attack Executor Module.
+
+    Purpose: Execute the plan generated by the Attack Analyst and record the fact of successful or unsuccessful exploitation.
+
+    Implementation: Python script using Paramiko to connect to the "attacker host" inside EVE-NG and execute commands.
+
+    Workflow:
+
+        Receives the JSON plan from the Attack Analyst as input.
+
+        Establishes an SSH connection to the Attacker Host (Ubuntu VM).
+
+        Interprets the plan: for the step {"type": "connectivity_check", "tool": "ping", "target": "192.168.1.100"} executes the command ping -c 4 192.168.1.100.
+
+        Captures the command's stdout/stderr, saves it to a log.
+
+        Determines success: if ping shows 0% packet loss, the attack is considered successful.
+
+        Forms a report: {"attack_successful": true, "evidence": "64 bytes from 192.168.1.100: icmp_seq=1 ttl=64 time=0.5 ms", "timestamp": "..."}.
+
+3.4. Remediation Synthesizer Module.
+
+    Purpose: Based on the report of a successful attack and the original configuration, generate a minimal set of IOS commands to eliminate the vulnerability.
+
+    Architecture:
+
+        Synthesis Core: Fine-tuned language model CodeLlama-13B-Instruct.
+
+            Dataset for fine-tuning: 3000+ examples like:
+        json
+
+{
+  "input": "Vulnerability: V-220668. Description: Access port Gi2 is in default VLAN 1. Current config snippet: 'interface Gi2\\n switchport access vlan 1'. Goal: Move port to a non-default VLAN (e.g., 100).",
+  "output": "configure terminal\ninterface GigabitEthernet2\nswitchport access vlan 100\nend\nwrite memory"
+}
+
+    Inference: Uses Ollama (easier to deploy for models up to 13B). Prompt template:
+
+text
+
+You are a Cisco IOS expert. Generate a minimal set of commands to fix the vulnerability.
+Vulnerability: {vulnerability_description}.
+Attack context: {attack_report}.
+Current interface configuration: {interface_config}.
+Requirement: The fix must be idempotent and safe. Use VLAN 100.
+Output only commands, no explanations.
+
+        Syntax Validator: The generated commands are run through a Cisco IOS simulator (e.g., Cisco pyATS Genie in config validation mode) or executed with a dry-run flag, if supported, to check for syntax errors.
+
+3.5. Remediation Applier Module.
+
+    Purpose: Safely apply the generated patch to the target switch.
+
+    Implementation: Python script based on Netmiko.
+
+    "Safe Application" Algorithm:
+
+        Backup: Before making changes, show running-config is executed and saved to file backup_pre_remediation.cfg.
+
+        Application: Commands are sent to the device sequentially. Status is checked after each potentially dangerous command.
+
+        On-the-fly Verification: After applying the patch, show running-config interface Gi2 is immediately executed to verify that switchport access vlan 1 has changed to switchport access vlan 100.
+
+        Rollback Plan: A sequence of commands for rollback (from backup) is prepared in advance. In case of an error at step 3 or a timeout, rollback is performed automatically.
+
+        Configuration Save: If all checks pass, write memory (or copy running-config startup-config) is executed.
+
+3.6. Verification & Evidence Module.
+
+    Purpose: Ensure the fix is effective and form a cryptographically verifiable chain of evidence for the entire cycle.
+
+    Components:
+
+        Re-Test: The module calls the Attack Executor with an exact copy of the original attack plan. Expected result — "attack_successful": false (ping fails).
+
+        Log and Metric Collector: Uses Vector 0.35.0 to collect logs from all components (controller, modules, syslog from CSR1000v) and send them to Elasticsearch 8.11.
+
+        Analytics Engine (in Elastic): Kibana Alerting rules are created:
+
+            Rule ATTACK-SUCCESS: Triggers when a log from Attack Executor appears with attack_successful: true.
+
+            Rule REMEDIATION-APPLIED: Triggers when a log from Remediation Applier appears about successful write memory.
+
+            Rule VERIFICATION-PASS: Triggers if, after REMEDIATION-APPLIED, the ATTACK-SUCCESS rule does NOT trigger within 5 minutes.
+
+        Evidence Generator:
+
+            Collects all key cycle artifacts:
+
+                Original backup_pre_remediation.cfg (SHA-256 hash).
+
+                Attack Analyst report (JSON).
+
+                Attack Executor report (JSON).
+
+                Generated patch (text).
+
+                Patch application log.
+
+                Re-test report (JSON).
+
+                Kibana rule triggers.
+
+            Builds a Merkle Tree (using the merkletools library), where the leaves are the hashes of each artifact. The tree root (Merkle Root) is a compact representation of the integrity of the entire dataset.
+
+            Forms the final report in JSON-LD format, including all artifacts, Merkle Root, and a digital signature of the root using a YubiKey PIV hardware token (via the python-pkcs11 library).
+
+4. OPERATION SEQUENCE (WORKFLOW) AND COMPONENT INTERACTION
+
+Step 0: Preparation (Manual). The operator runs the command on the host: python zero1_controller.py --target-lab zero1-mvp --stig-id V-220668.
+
+Step 1: Environment Initialization.
+
+    The Controller calls POST /api/v1/lab/init.
+
+    Terraform is launched, deploying a clean lab in EVE-NG.
+
+    Ansible is launched, loading the vulnerable configuration onto the CSR1000v and configuring the hosts.
+
+    The Controller waits for all nodes to be ready (checks SSH availability).
+
+    A snapshot of the CSR1000v virtual machine snapshot_pre_test is created. The snapshot hash is recorded (artifact A1).
+
+Step 2: Analysis and Attack Phase.
+
+    The Controller calls POST /api/v1/attack/analyze with parameters (CSR IP, credentials).
+
+    The Attack Analyst module performs data collection, analysis via LLM, and returns a plan.
+
+    The Controller saves the analysis report (JSON). The report hash is recorded (artifact A2).
+
+    The Controller calls POST /api/v1/attack/execute with the received plan.
+
+    The Attack Executor module executes the plan (ping). Returns a success report.
+
+    The Controller saves the attack report. The report hash is recorded (artifact A3).
+
+    The ATTACK-SUCCESS rule triggers in Elasticsearch. The fact of triggering is recorded (artifact A4).
+
+Step 3: Remediation Synthesis and Application Phase.
+
+    The Controller calls POST /api/v1/remediation/generate, passing artifacts A2 and A3.
+
+    The Remediation Synthesizer module generates a patch. The Controller saves it. The patch hash is recorded (artifact A5).
+
+    The Controller calls POST /api/v1/remediation/apply, passing artifact A5.
+
+    The Remediation Applier module applies the patch, creates a backup, checks the result, saves the configuration.
+
+    The Controller saves the application log. The log hash is recorded (artifact A6).
+
+    The REMEDIATION-APPLIED rule triggers in Elasticsearch. The fact of triggering is recorded (artifact A7).
+
+Step 4: Verification Phase.
+
+    The Controller calls POST /api/v1/verify.
+
+    The Verification module launches a re-test by calling the Attack Executor with the same plan as in Step 2.
+
+    Attack Executor performs ping, which should fail (Destination Host Unreachable).
+
+    The Verification module waits for 5 minutes. The ATTACK-SUCCESS rule does NOT trigger again.
+
+    The VERIFICATION-PASS rule triggers in Elasticsearch. The fact of triggering is recorded (artifact A8).
+
+    The Controller saves the re-test report. The report hash is recorded (artifact A9).
+
+Step 5: Evidence Package Formation.
+
+    The Controller calls the Evidence Generator, passing the list of artifacts A1-A9.
+
+    The Generator builds a Merkle Tree, calculates the Merkle Root MR1.
+
+    The Generator requests a digital signature for MR1 using the YubiKey. Receives signature SIG1.
+
+    The final document ZERO1-Report-<timestamp>.json is formed, containing:
+
+        Metadata (Cycle ID, target, timestamps).
+
+        Links to all artifacts (A1-A9) with their hashes.
+
+        Merkle Tree structure and MR1 value.
+
+        Digital signature SIG1 and certificate from the YubiKey.
+
+        Final verdict: REMEDIATION_VERIFIED.
+
+    The Controller returns the path to the report file to the operator. The cycle is complete.
+
+5. ACCEPTANCE CRITERIA AND QUALITY METRICS
+
+5.1. Functional Criteria (Functional Acceptance Criteria).
+
+    F-AC1: The system must deploy the test environment (EVE-NG Lab with CSR1000v and two Ubuntu VMs) with one command without manual intervention.
+
+    F-AC2: The Attack Analyst module must correctly identify the presence of a port in VLAN 1 based on the results of the show vlan brief and show run interface Gi2 commands.
+
+    F-AC3: The Attack Executor module must, upon receiving the plan {"tool": "ping", "target": "192.168.1.100"}, successfully establish an ICMP session with the target host and record this fact.
+
+    F-AC4: The Remediation Synthesizer module must, based on the fact of a successful attack, generate valid Cisco IOS commands to move interface Gi2 from VLAN 1 to VLAN 100.
+
+    F-AC5: The Remediation Applier module must apply the generated commands, ensure their saving in startup-config, and perform an automatic rollback in case of an error.
+
+    F-AC6: The Verification module must, after applying the fix, launch an identical attack and record its failure.
+
+    F-AC7: The system must form a final report containing a cryptographic signature verifiable by standard means (e.g., openssl dgst -verify).
+
+5.2. Non-Functional Requirements and Metrics (Non-Functional Requirements).
+
+    Performance:
+
+        NFR-P1: Lab deployment time (Step 1) ≤ 20 minutes.
+
+        NFR-P2: Full cycle execution time (Steps 2-5) ≤ 100 minutes. Target: 120 min.
+
+        NFR-P3: Inference of one LLM (analysis or synthesis) ≤ 3 minutes.
+
+    Reliability:
+
+        NFR-R1: Cycle successful completion rate (Success Rate) over 10 runs ≥ 90%.
+
+        NFR-R2: The system must correctly handle network timeouts when connecting to CSR1000v and perform no more than 3 retry attempts.
+
+    Accuracy:
+
+        NFR-A1: Accuracy of detecting vulnerability V-220668 by the Attack Analyst module = 100% (false positives are not allowed).
+
+        NFR-A2: Accuracy of generating syntactically correct IOS commands by the Remediation Synthesizer module ≥ 99%.
+
+    Security:
+
+        NFR-S1: All credentials (SSH passwords, enable secret) are stored in HashiCorp Vault. Only references are present in code and configs.
+
+        NFR-S2: The digital signature of the report must be created using a private key on a hardware token (YubiKey). The private key never leaves the token.
+
+6. IMPLEMENTATION PLAN (ROADMAP) AND WORK PROCEDURE
+
+Total duration of Phase 1 (MVP): 90 calendar days. Work is conducted in two parallel streams: Lab and Automation, and ML/LLM Components.
+
+6.1. Stream A: Lab, Automation, and System Framework (45 days)
+Sprint	Timeline	Key Tasks	Completion Criteria (Definition of Done)
+Sprint A1	Days 1-15	1. Base Infrastructure: Installation and configuration of the host (ESXi, Ubuntu), EVE-NG Pro, Docker.
+2. Images: Preparation and import of CSR1000v and Ubuntu images into EVE-NG.
+3. Network: Configuration of isolated networks in EVE-NG (Management, Lab).	1. From EVE-NG WebUI, CSR1000v and Ubuntu VM can be manually launched, connected by a network.
+2. SSH access from the host to EVE-NG and to launched VMs is available.
+Sprint A2	Days 16-30	1. Infrastructure as Code: Development of Terraform modules for managing EVE-NG nodes via API/CLI.
+2. Configuration Management: Creation of Ansible roles for loading vulnerable configuration onto CSR1000v and configuring Ubuntu (IP, ping, HTTP).
+3. Base Pipeline: Writing a Python script (lab_manager.py) that invokes Terraform, then Ansible with one command.	1. The command terraform apply in the project folder creates the full topology in EVE-NG.
+2. The command ansible-playbook deploy.yml configures all devices.
+3. The script python lab_manager.py --deploy executes both steps. The lab is ready for testing.
+Sprint A3	Days 31-45	1. Controller Framework: Development of a FastAPI application with endpoints from section 3.1 (stubs for now).
+2. Executor and Applier Modules: Implementation of classes for SSH connection (Paramiko/Netmiko), command execution, output parsing via TextFSM.
+3. Monitoring: Deployment of Elastic Stack in Docker, configuration of syslog reception from CSR1000v, creation of Kibana indices.	1. The service zero1-controller is running. GET /api/v1/status returns {"status": "ready"}.
+2. Scripts attack_executor.py and remediation_applier.py exist, capable of performing manual ping and applying a patch hardcoded in the script.
+3. Logs from the switch are visible in Kibana.
+
+6.2. Stream B: ML/LLM Components and Analytics (45 days)
+Sprint	Timeline	Key Tasks	Completion Criteria (Definition of Done)
+Sprint B1	Days 1-22	1. Dataset Preparation: Collection and labeling of data for fine-tuning. For Attack Analyst: pairs (show run, show vlan) -> (finding JSON). For Remediation Synthesizer: pairs (finding, config snippet) -> (IOS commands).
+2. ML Infrastructure Setup: Installation of CUDA, PyTorch, Hugging Face libraries, vLLM, Ollama on the host server.
+3. Base Fine-tuning: Loading base models (Llama-3.1-8B, CodeLlama-13B) and their initial fine-tuning on prepared datasets.	1. Two datasets in .jsonl format with at least 1000 examples each exist.
+2. vLLM and ollama commands work, can load a base model.
+3. The fine-tuning process starts and saves adapted model weights.
+Sprint B2	Days 23-37	1. Model Integration and Testing: Creation of Python wrapper classes for interaction with vLLM/Ollama API.
+2. Prompt Engineering Development: Fine-tuning of prompt templates to achieve stable and structured output.
+3. Output Validation: Implementation of jsonschema validators for model output JSON.	1. The class LLMAnalyst can accept show vlan text as input and return JSON with "stig_id": "V-220668".
+2. The class LLMRemediator generates commands interface Gi2\n switchport access vlan 100 based on the described vulnerability.
+3. Incorrect model output is caught by the validator, fallback logic or error is triggered.
+Sprint B3	Days 38-45	1. Integration with Controller: Modification of stubs in the controller to call real ML classes.
+2. Creation of Evidence Generator Module: Implementation of Merkle Tree, integration with YubiKey PIV for signing.
+3. Writing Elastic Rules: Creation of Kibana Alerting rules for detecting attack success and patch application.	1. The endpoint /api/v1/attack/analyze returns the result of real LLM analysis.
+2. The script evidence.py forms the final report with a signature.
+3. Rules ATTACK-SUCCESS and REMEDIATION-APPLIED are created and working in Kibana.
+
+6.3. Integration, Debugging, and Acceptance Testing Phase (20 days)
+
+    Days 46-65: Bringing the two streams together. End-to-end debugging of the full cycle, handling edge-cases (network errors, timeouts, incorrect LLM output). Setting up logging for all stages. Performance tuning.
+
+    Days 66-90: Formal acceptance testing. Conducting 10 consecutive autonomous runs of the system. Documenting results against all criteria from section 5. Preparing the final demonstration for stakeholders.
+
+7. RISK ASSESSMENT AND MITIGATION PLAN
+Risk Category	Specific Risk	Probability	Impact	Mitigation Measures (Mitigation)
+Technological	LLM produces "hallucinations": incorrect analysis or dangerous commands.	High	Critical	1. Strict validation of output against a JSON schema. 2. Checksums and dry-run: For equipment commands, use show verify or execute in configuration commit confirmed with automatic rollback. 3. Fallback logic: In case of repeated LLM error, use a hardcoded template for the specific vulnerability V-220668.
+	Network emulation instability (EVE-NG/CSR1000v).	Medium	High	1. Detection and restart: The Controller should monitor node availability via SSH. If CSR1000v is unavailable for more than 2 minutes — restart the lab from scratch. 2. Using snapshots: Before each test, restore from a clean snapshot, not reconfigure a "dirty" system.
+Operational	Difficulty in reproducing the environment (issues with image licenses, software versions).	Medium	High	1. Full containerization of all components except EVE-NG and the hypervisor. Use of Dockerfile and docker-compose.yml. 2. Detailed documentation on versions and the CSR1000v licensing process. 3. Backup of ready VM images.
+	Insufficient LLM inference performance on available GPU.	Medium	Medium	1. Model optimization: Use quantization (4-bit, GPTQ) to accelerate inference with minimal quality loss. 2. Use of smaller models: For MVP, consider Llama-3.2-3B and CodeLlama-7B. 3. Prompt caching.
+Project	Missed deadlines due to component integration complexity.	High	High	1. Clear modular testing. Each module (Analyst, Executor, etc.) must have a set of unit and integration tests. 2. Weekly standups of the two streams (A and B) for API synchronization. 3. Prioritization: First implement the "core" with hardcoded logic, then integrate LLM.
+
+8. TEAM REQUIREMENTS, ROLES, AND BUDGET ESTIMATE
+
+8.1. Team for Phase 1 (MVP):
+
+    Lead Engineer (Tech Lead) / Architect (1 person): Overall architecture, interaction protocols, integration. Knowledge: Python, network protocols, DevOps, ML basics.
+
+    DevOps Engineer / Network Engineer (1 person): Deployment and automation of EVE-NG, work with Terraform/Ansible, network configuration, CSR1000v. Knowledge: Cisco IOS, EVE-NG, IaC, Linux.
+
+    ML/LLM Engineer (1 person): Dataset preparation, model fine-tuning, inference optimization, prompt engineering. Knowledge: PyTorch, Hugging Face, vLLM, working with LLMs.
+
+    Security Engineer / Developer (1 person, part-time): Implementation of safe application modules, work with cryptography (Merkle Tree, YubiKey), configuration of Elastic Stack and detection rules.
+
+8.2. Budget Estimate for Phase 1 (90 days):
+
+    Equipment (CAPEX, one-time):
+
+        Server (with GPU) or cloud rental with an instance like g5.48xlarge (AWS) / NC96ads_A100_v4 (Azure): ~1,800,000 rubles (approximately).
+
+        Hardware tokens YubiKey PIV (2 pcs.): ~15,000 rubles.
+
+    Licensed Software:
+
+        EVE-NG Professional license: ~60,000 rubles.
+
+        Cisco CSR1000v image (or using VIRL/CML subscription): ~150,000 rubles.
+
+    Labor Cost Fund (OPEX, 90 days):
+
+        IT specialists (3.5 positions), average cost: ~2,500,000 rubles.
+
+Total approximate budget for Phase 1: ~4,525,000 rubles.
+
+9. CONCLUSION AND NEXT STEPS
+
+Project ZERO-1 is a focused, technically rich prototype aimed at proving the fundamental possibility of automating one of the most labor-intensive processes in cybersecurity — checking and correcting network equipment configurations.
+
+The key result of successful MVP implementation: Not a report or presentation, but a working system that, with a single command, performs a full cycle and outputs a cryptographically verifiable artifact proving that a specific vulnerability was found, proven, and eliminated. This artifact is the basis for transitioning to the next stages.
+
+Roadmap after successful MVP (Phase 1.5 and Phase 2):
+
+    Phase 1.5 (Coverage Expansion, +4 months):
+
+        Adding support for 5-7 new DISA STIG checks for Cisco IOS (disabling services, ACL, password policy).
+
+        Integration with MITRE D3FEND to improve the quality of generated countermeasures.
+
+        Creating a simple Web interface for managing cycles and viewing reports.
+
+    Phase 2.0 (Coevolution and Productization, +6 months):
+
+        Transforming the linear pipeline into a coevolutionary loop: two LLM instances (attacker and defender) compete in adaptive rounds, where each next attack step is built considering previous defenses.
+
+        Support for another network equipment vendor (Juniper JunOS).
+
+        Packaging the solution as a SaaS service or on-premise hardware complex ("box") for delivery to customers.
+
+This document is a comprehensive technical specification for starting work on Phase 1 (MVP).
+
+APPENDICES (APPENDIX)
+
+Appendix A: Glossary of Terms.
+
+    STIG (Security Technical Implementation Guide): A document with security requirements for specific software or device.
+
+    IaC (Infrastructure as Code): The practice of managing infrastructure using configuration files.
+
+    LLM (Large Language Model): A large language model based on the transformer architecture.
+
+    Fine-tuning: The process of additional training of a pre-trained model on a specialized dataset.
+
+    Inference: The process of obtaining output from a model on new data.
+
+    Merkle Tree: A cryptographic data structure for efficient verification of the integrity of a large dataset.
+
+    PIV (Personal Identity Verification): A standard for smart cards and hardware tokens used for storing cryptographic keys.
+
+Appendix B: Links to Key Technologies and Repositories.
+
+    EVE-NG: https://www.eve-ng.net/
+
+    Cisco CSR1000v: https://developer.cisco.com/docs/csr1000v-getting-started/
+
+    DISA STIG Viewer: https://public.cyber.mil/stigs/
+
+    Llama 3.2: https://llama.meta.com/llama3/
+
+    CodeLlama: https://ai.meta.com/blog/code-llama-large-language-model-coding/
+
+    vLLM: https://github.com/vllm-project/vllm
+
+    Ollama: https://ollama.ai/
+
+    Netmiko: https://github.com/ktbyers/netmiko
+
+    Elastic Stack: https://www.elastic.co/
+
+Appendix C: Key JSON Message Formats (Schemas).
+(Example schema for Attack Analyst report)
+json
+
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Attack Analyst Report",
+  "type": "object",
+  "required": ["findings", "attack_plan"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stig_id", "description", "severity"],
+        "properties": {
+          "stig_id": {"type": "string", "pattern": "^V-\\d+$"},
+          "description": {"type": "string"},
+          "severity": {"type": "string", "enum": ["high", "medium", "low"]}
+        }
+      }
+    },
+    "attack_plan": {
+      "type": "object",
+      "required": ["goal", "steps"],
+      "properties": {
+        "goal": {"type": "string"},
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["type", "tool", "target"],
+            "properties": {
+              "type": {"type": "string"},
+              "tool": {"type": "string"},
+              "target": {"type": "string", "format": "ipv4"}
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+[File Content End]

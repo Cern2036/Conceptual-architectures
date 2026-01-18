@@ -1,0 +1,1204 @@
+Appendix K: Troubleshooting Guide
+
+K.1. General Diagnostic Methodology
+
+K.1.1. Diagnostic Decision Tree
+text
+
+Problem Detected → Check Kibana Logs (http://localhost:5601) →
+→ Identify Source Module →
+→ Check Metrics in Grafana →
+→ Consult Common Issues Table (K.2) →
+→ Apply Specific Solution
+
+K.1.2. Key Diagnostic Commands
+bash
+
+# 1. Overall System Status
+./manage-system.sh status
+
+# 2. Check Recent Error Logs
+docker compose logs --tail=50 --timestamps | grep -E "(ERROR|FAILED|exception|timeout)"
+
+# 3. Check Health of All Services
+curl -s http://localhost:8000/api/v1/health | jq .
+curl -s http://localhost:8080/health | jq .
+curl -f http://localhost:9000/minio/health/live
+curl -f http://localhost:9200/_cluster/health
+
+# 4. Check Disk Space
+df -h /var/lib/docker/
+
+# 5. Check GPU Usage
+nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv
+
+K.2. Common Issues and Solutions Table
+
+K.2.1. Lab Deployment Issues
+Symptom	Possible Cause	Solution
+Lab initialization timeout error in controller logs	EVE-NG API unavailable	1. Check EVE-NG status: systemctl status eve-ng
+2. Check network connectivity: ping <eve-ng-ip>
+3. Restart EVE-NG: systemctl restart eve-ng
+Terraform fails to create lab	Insufficient resources on EVE-NG host	1. Check free memory: free -h
+2. Check available images in EVE-NG
+3. Increase memory limits for virtual machines
+Ansible cannot connect to CSR1000v	Incorrect credentials or network ACLs	1. Check credentials in HashiCorp Vault
+2. Test SSH connectivity to CSR1000v from management host
+3. Check firewall settings in EVE-NG
+
+K.2.2. Attack Analyst Module Issues
+Symptom	Possible Cause	Solution
+LLM returns empty or incorrect JSON	Prompt engineering or model issue	1. Check ML service logs: docker compose logs ml-service
+2. Validate input data
+3. Reload model: curl -X POST http://ml-service:8080/models/reload
+Netmiko timeout when connecting to device	Network or device issues	1. Check device accessibility: nc -zv <device-ip> 22
+2. Increase timeouts in Netmiko configuration
+3. Check device load (CPU)
+TextFSM parser fails to process CLI output	Template mismatch	1. Verify NTC templates are up-to-date
+2. Add raw output to logs for analysis
+3. Use fallback regular expressions
+
+K.2.3. Attack Executor Module Issues
+Symptom	Possible Cause	Solution
+Ping fails even though vulnerability exists	EVE-NG networking stack issues	1. Check ARP table on CSR1000v
+2. Check destination VLAN on switch
+3. Check firewall rules on Ubuntu VM
+SSH connection to attacker host drops	Virtual machine resource issues	1. Increase VM memory in EVE-NG
+2. Check load on EVE-NG host
+3. Recreate VM from template
+
+K.2.4. Remediation Module Issues
+Symptom	Possible Cause	Solution
+Generated commands cause device error	Syntax error or unsupported command	1. Check IOS version and command syntax
+2. Enable dry-run mode for validation
+3. Use show parser dump for debugging
+Applying patch causes loss of management	Conflicting configuration	1. Automatic rollback should trigger (check rollback_logs)
+2. Check device snapshot in EVE-NG
+3. Manual restore from backup
+
+K.2.5. Performance Issues
+Symptom	Possible Cause	Solution
+Cycle time exceeds 120 minutes	GPU load or network latency	1. Check GPU utilization: nvidia-smi
+2. Optimize prompts to reduce inference time
+3. Cache analysis results for identical configurations
+High CPU load on host	Memory leak or infinite loops	1. Check containers: docker stats
+2. Restart problematic services
+3. Increase host resources
+
+K.3. Step-by-Step Procedures for Critical Failures
+
+K.3.1. Complete Loss of Connectivity to EVE-NG
+bash
+
+#!/bin/bash
+# recovery-eve-ng.sh
+
+echo "🚨 Restoring connectivity to EVE-NG"
+
+# 1. Check basic connectivity
+if ! ping -c 3 ${EVE_NG_IP}; then
+    echo "❌ EVE-NG unreachable by IP"
+    escalate_to_network_team
+    exit 1
+fi
+
+# 2. Check EVE-NG services
+if ! curl -f http://${EVE_NG_IP}:8080/api/status; then
+    echo "🔄 Restarting EVE-NG..."
+    ssh root@${EVE_NG_IP} "systemctl restart eve-ng"
+    sleep 60
+fi
+
+# 3. Check lab status
+if ! curl -f http://${EVE_NG_IP}:8080/api/labs/zero1-mvp; then
+    echo "🔄 Restoring lab from template..."
+    curl -X POST http://${EVE_NG_IP}:8080/api/labs \
+        -d '{"name": "zero1-mvp", "template": "zero1-base"}'
+fi
+
+# 4. Validation
+if curl -f http://${EVE_NG_IP}:8080/api/labs/zero1-mvp/nodes; then
+    echo "✅ EVE-NG restored"
+else
+    echo "❌ Failed to restore EVE-NG"
+    escalate_to_level_3
+fi
+
+K.3.2. Database Corruption
+bash
+
+#!/bin/bash
+# recovery-database-corruption.sh
+
+echo "🗄️  Recovering from database corruption"
+
+# 1. Stop writes to DB
+docker compose stop zero1-controller scheduler worker
+
+# 2. Check integrity
+if ! docker compose exec postgres pg_catalog.pg_checkdb(); then
+    echo "⚠️  Database corruption detected"
+    
+    # 3. Restore from latest snapshot
+    LAST_BACKUP=$(aws s3 ls s3://zero1-backups/postgres/ | tail -1 | awk '{print $4}')
+    aws s3 cp s3://zero1-backups/postgres/${LAST_BACKUP} /tmp/recovery.sql.gz
+    
+    # 4. Perform restoration
+    gunzip -c /tmp/recovery.sql.gz | docker compose exec -T postgres psql -U zero1
+    
+    # 5. Verification
+    docker compose exec postgres psql -U zero1 -c "SELECT COUNT(*) FROM test_cycles;"
+fi
+
+# 6. Start services
+docker compose start zero1-controller scheduler worker
+
+K.4. Diagnostic Utilities
+
+K.4.1. System Diagnostic Script
+python
+
+#!/usr/bin/env python3
+"""
+zero1-diagnostic.py - Comprehensive system diagnostic
+"""
+
+import subprocess
+import json
+import requests
+from datetime import datetime
+
+def check_docker_services():
+    """Check Docker service states"""
+    result = subprocess.run(
+        ["docker", "compose", "ps", "--format", "json"],
+        capture_output=True, text=True
+    )
+    
+    services = json.loads(result.stdout)
+    unhealthy = [s for s in services if "unhealthy" in s.get("Status", "")]
+    
+    return {
+        "total": len(services),
+        "unhealthy": len(unhealthy),
+        "details": unhealthy
+    }
+
+def check_api_endpoints():
+    """Check API endpoint availability"""
+    endpoints = [
+        ("Controller", "http://localhost:8000/api/v1/health"),
+        ("ML Service", "http://localhost:8080/health"),
+        ("MinIO", "http://localhost:9000/minio/health/live"),
+        ("Elasticsearch", "http://localhost:9200/_cluster/health"),
+    ]
+    
+    results = []
+    for name, url in endpoints:
+        try:
+            response = requests.get(url, timeout=5)
+            results.append({
+                "service": name,
+                "status": "healthy" if response.status_code == 200 else "unhealthy",
+                "response_time": response.elapsed.total_seconds()
+            })
+        except Exception as e:
+            results.append({
+                "service": name,
+                "status": "unreachable",
+                "error": str(e)
+            })
+    
+    return results
+
+def check_resource_usage():
+    """Check resource utilization"""
+    # Check disk
+    disk = subprocess.run(
+        ["df", "-h", "/var/lib/docker"],
+        capture_output=True, text=True
+    ).stdout
+    
+    # Check memory
+    memory = subprocess.run(
+        ["free", "-h"],
+        capture_output=True, text=True
+    ).stdout
+    
+    return {"disk": disk, "memory": memory}
+
+def generate_report():
+    """Generate diagnostic report"""
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "docker_services": check_docker_services(),
+        "api_endpoints": check_api_endpoints(),
+        "resources": check_resource_usage(),
+        "recommendations": []
+    }
+    
+    # Analysis and recommendations
+    if report["docker_services"]["unhealthy"] > 0:
+        report["recommendations"].append(
+            "Restart faulty services: ./manage-system.sh restart"
+        )
+    
+    unhealthy_apis = [e for e in report["api_endpoints"] if e["status"] != "healthy"]
+    if unhealthy_apis:
+        report["recommendations"].append(
+            f"Restore API endpoints: {[e['service'] for e in unhealthy_apis]}"
+        )
+    
+    return report
+
+if __name__ == "__main__":
+    report = generate_report()
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+K.4.2. Real-time Monitoring
+bash
+
+#!/bin/bash
+# live-monitor.sh
+
+watch -n 5 '
+echo "=== Project ZERO-1 Live Monitor ==="
+echo "Time: $(date)"
+echo ""
+echo "1. Service Status:"
+docker compose ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}"
+echo ""
+echo "2. Resource Usage:"
+docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+echo ""
+echo "3. Active Cycles:"
+docker compose exec -T postgres psql -U zero1 -c "SELECT cycle_id, overall_status, start_time FROM test_cycles WHERE overall_status = '"'"'running'"'"';"
+'
+
+Appendix L: Security Policies and Compliance
+
+L.1. Core Security Principles
+
+L.1.1. Principle of Least Privilege
+yaml
+
+# zero1-rbac-policies.yml
+role_definitions:
+  zero1_operator:
+    permissions:
+      - start_cycle
+      - view_reports
+      - system_status
+    denied:
+      - modify_secrets
+      - access_raw_data
+      - bypass_approval
+  
+  zero1_auditor:
+    permissions:
+      - view_all_reports
+      - verify_signatures
+      - export_evidence
+    denied:
+      - execute_cycles
+      - modify_config
+  
+  zero1_admin:
+    permissions:
+      - full_system_access
+    constraints:
+      - mfa_required: true
+      - ip_whitelist: ["10.0.0.0/8"]
+      - time_restriction: "08:00-18:00"
+
+L.1.2. Defense in Depth
+text
+
+Level 1: Network Segmentation (EVE-NG isolated network)
+Level 2: Authentication (JWT + MFA)
+Level 3: Authorization (RBAC)
+Level 4: Encryption (TLS 1.3, encrypted volumes)
+Level 5: Audit (full traceability, immutable logs)
+Level 6: Cryptographic Verification (Merkle trees, hardware signing)
+
+L.2. Data Handling Policies
+
+L.2.1. Data Classification
+yaml
+
+data_classes:
+  confidential:
+    - network_device_configs
+    - security_findings
+    - credentials
+    - digital_signatures
+    retention: 7 years
+    encryption: mandatory (AES-256-GCM)
+    access_logging: full
+    
+  internal:
+    - system_logs
+    - performance_metrics
+    - ml_model_weights
+    retention: 1 year
+    encryption: recommended
+    access_logging: aggregated
+    
+  public:
+    - anonymized_statistics
+    - compliance_reports
+    - system_status
+    retention: 5 years
+    encryption: not required
+    access_logging: minimal
+
+L.2.2. Retention and Deletion Policy
+bash
+
+#!/bin/bash
+# data-retention-policy.sh
+
+# Automatic deletion of old data
+RETENTION_DAYS=365
+
+echo "🧹 Applying data retention policy..."
+
+# 1. Delete old cycles from database
+docker compose exec -T postgres psql -U zero1 -c "
+    DELETE FROM test_cycles 
+    WHERE created_at < NOW() - INTERVAL '${RETENTION_DAYS} days'
+    AND overall_status != 'running';
+"
+
+# 2. Delete corresponding artifacts from MinIO
+CYCLES_TO_DELETE=$(docker compose exec -T postgres psql -U zero1 -t -c "
+    SELECT cycle_id FROM test_cycles 
+    WHERE created_at < NOW() - INTERVAL '${RETENTION_DAYS} days';
+")
+
+for CYCLE in $CYCLES_TO_DELETE; do
+    docker compose run --rm mc rm --recursive --force minio/zero1-artifacts/cycles/${CYCLE}
+done
+
+# 3. Rotate Elasticsearch logs
+curl -X POST "http://localhost:9200/_ilm/policy/zero1_logs_policy/_execute"
+
+L.3. Standards Compliance
+
+L.3.1. DISA STIG Compliance
+yaml
+
+stig_compliance_framework:
+  controls:
+    - id: "V-220668"
+      description: "Default VLAN not assigned to access ports"
+      implementation:
+        automated_detection: "Attack Analyst module"
+        automated_remediation: "Remediation Synthesizer module"
+        verification: "Verification module"
+        evidence: "Digital signature in final report"
+    
+    - id: "V-220543"
+      description: "Password encryption required"
+      status: "planned_for_phase_1.5"
+      
+    - id: "V-220521"
+      description: "SSH version 2 required"
+      status: "planned_for_phase_1.5"
+
+  validation_procedures:
+    quarterly_audit:
+      frequency: "every 3 months"
+      scope: "all STIG checks"
+      method: "automated + manual sampling"
+      responsible: "Chief Security Officer"
+    
+    continuous_compliance:
+      frequency: "continuous"
+      scope: "active checks"
+      method: "automated monitoring"
+      alerts: "Kibana + Slack notifications"
+
+L.3.2. NIST Cybersecurity Framework Mapping
+yaml
+
+nist_csf_mapping:
+  identify:
+    - asset_management: "Inventory of all network devices"
+    - risk_assessment: "Risk assessment based on STIG findings"
+    
+  protect:
+    - access_control: "RBAC, MFA, network segmentation"
+    - data_security: "Encryption at rest and in transit"
+    - maintenance: "Automated patching through remediation"
+    
+  detect:
+    - anomalies_and_events: "Elasticsearch monitoring and alerting"
+    - security_continuous_monitoring: "Real-time verification cycles"
+    
+  respond:
+    - response_planning: "Disaster recovery procedures (Appendix I)"
+    - communications: "Alerting system (Slack, email)"
+    
+  recover:
+    - recovery_planning: "Backup and restore procedures"
+    - improvements: "Lessons learned from failed cycles"
+
+L.4. Cryptographic Policies
+
+L.4.1. Key Management Policy
+yaml
+
+key_management_policy:
+  hardware_security_modules:
+    primary: "YubiKey PIV (FIPS 140-2 Level 2)"
+    backup: "Thales HSM (off-site)"
+    
+  key_generation:
+    algorithm: "RSA 4096 or ECC P-384"
+    source: "HSM hardware random generator"
+    ceremony: "two operators + witness"
+    
+  key_storage:
+    private_keys: "never leave HSM"
+    public_keys: "stored in HashiCorp Vault with ACL"
+    
+  key_rotation:
+    frequency: "annually or upon compromise"
+    procedure: "generate new key pair, re-sign archive"
+    
+  revocation:
+    conditions:
+      - suspected_compromise
+      - employee_termination
+      - key_expiration
+    mechanism: "CRL + OCSP stapling"
+
+L.4.2. Signing Policy
+python
+
+# signing-policy.py
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from datetime import datetime, timedelta
+
+class SigningPolicy:
+    """Cryptographic signing policy"""
+    
+    VALID_ALGORITHMS = ["RSASSA-PSS", "ECDSA-SHA384"]
+    MIN_KEY_SIZE = {"RSA": 3072, "ECC": 256}
+    MAX_SIGNATURE_AGE = timedelta(days=365)
+    
+    @classmethod
+    def validate_signature_context(cls, artifact_type, signer_role):
+        """Validate signing context"""
+        requirements = {
+            "final_report": {
+                "allowed_signers": ["zero1_system", "auditor"],
+                "required_timestamp": True,
+                "requires_counter_signature": True
+            },
+            "remediation_patch": {
+                "allowed_signers": ["zero1_system"],
+                "required_timestamp": True,
+                "requires_approval": True
+            }
+        }
+        
+        if artifact_type not in requirements:
+            raise ValueError(f"Unsupported artifact type: {artifact_type}")
+        
+        req = requirements[artifact_type]
+        if signer_role not in req["allowed_signers"]:
+            raise ValueError(f"Signer {signer_role} not allowed for {artifact_type}")
+        
+        return req
+
+L.5. Audit and Monitoring Policy
+
+L.5.1. Immutable Logging
+bash
+
+#!/bin/bash
+# immutable-logs-setup.sh
+
+# Configure Docker auditing
+cat > /etc/docker/daemon.json << EOF
+{
+  "log-driver": "local",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3",
+    "compress": "true"
+  },
+  "live-restore": true
+}
+EOF
+
+# Configure system auditing
+echo "Setting up immutable audit logs..."
+auditctl -w /var/log/zero1/ -p wa -k zero1_audit
+auditctl -w /opt/zero1/config/ -p wa -k zero1_config
+
+# Configure WORM storage for audit logs
+echo "Configuring WORM storage for audit logs..."
+mkdir -p /mnt/worm-storage/zero1-audit
+chattr +i /mnt/worm-storage/zero1-audit
+
+L.5.2. Incident Response Policy
+yaml
+
+incident_response_policy:
+  classification:
+    severity_levels:
+      critical:
+        response_time: "15 minutes"
+        escalation: "CISO + Legal"
+        examples:
+          - "root key compromise"
+          - "unauthorized configuration change"
+      
+      high:
+        response_time: "1 hour"
+        escalation: "Security Team Lead"
+        examples:
+          - "authentication bypass"
+          - "confidential data leak"
+  
+  procedures:
+    containment:
+      - "isolate affected systems"
+      - "disable compromised accounts"
+      - "activate backup systems"
+    
+    eradication:
+      - "patch vulnerabilities"
+      - "remove malicious code"
+      - "rotate all affected keys"
+    
+    recovery:
+      - "restore from trusted backups"
+      - "validate system integrity"
+      - "gradual return to normal operations"
+    
+    lessons_learned:
+      frequency: "after every critical or high severity incident"
+      deliverables:
+        - "incident report"
+        - "updated procedures"
+        - "updated training materials"
+
+Appendix M: Integration Tests and Test Scenarios
+
+M.1. Testing Architecture
+
+M.1.1. Test Pyramid
+text
+
+        ↗ E2E Tests (10%) - Full cycles
+       ↗ Integration Tests (20%) - Module interactions
+     ↗ Component Tests (30%) - Individual modules
+   ↗ Unit Tests (40%) - Functions and classes
+
+M.1.2. Test Environment
+yaml
+
+# docker-compose.test.yml
+services:
+  test-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: zero1_test
+  
+  test-minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+  
+  test-elasticsearch:
+    image: elasticsearch:8.11.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+  
+  mock-eve-ng:
+    image: python:3.11-slim
+    command: python -m http.server 8080
+    volumes:
+      - ./test_data/mock_responses:/mock_responses
+  
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      - test-postgres
+      - test-minio
+      - test-elasticsearch
+      - mock-eve-ng
+
+M.2. Integration Tests
+
+M.2.1. Full Cycle Test (End-to-End)
+python
+
+# tests/test_full_cycle.py
+import pytest
+import json
+from datetime import datetime
+from zero1_controller import CycleController
+from zero1_orchestrator import Orchestrator
+
+class TestFullCycle:
+    """Testing full cycle from detection to verification"""
+    
+    @pytest.fixture
+    def test_environment(self):
+        """Prepare test environment"""
+        return {
+            "device_ip": "192.168.1.1",
+            "device_type": "cisco_csr1000v",
+            "stig_id": "V-220668",
+            "expected_vulnerability": "interface Gi2 in VLAN 1"
+        }
+    
+    def test_cycle_happy_path(self, test_environment):
+        """Test successful execution of full cycle"""
+        
+        # 1. Initialize controller
+        controller = CycleController(test_mode=True)
+        
+        # 2. Start cycle
+        cycle_id = controller.start_cycle(
+            stig_id=test_environment["stig_id"],
+            target_device=test_environment["device_ip"]
+        )
+        
+        # 3. Monitor execution
+        max_wait_time = 7200  # 120 minutes
+        start_time = datetime.now()
+        
+        while (datetime.now() - start_time).seconds < max_wait_time:
+            status = controller.get_cycle_status(cycle_id)
+            
+            if status["overall_status"] == "completed":
+                # 4. Verify results
+                report = controller.get_cycle_report(cycle_id)
+                
+                # Assertions
+                assert report["verification_result"] == True
+                assert report["digital_signature"] is not None
+                assert len(report["artifacts"]) >= 9  # A1-A9
+                assert report["merkle_root_verified"] == True
+                
+                return  # Success
+            
+            elif status["overall_status"] == "failed":
+                pytest.fail(f"Cycle failed: {status.get('error_message')}")
+        
+        pytest.fail("Cycle timeout")
+    
+    def test_rollback_scenario(self):
+        """Test rollback during patch application failure"""
+        
+        # 1. Induce failure
+        sabotaged_device = MockDevice()
+        sabotaged_device.set_failure_mode("config_apply_failure")
+        
+        # 2. Start cycle
+        controller = CycleController()
+        cycle_id = controller.start_cycle(
+            stig_id="V-220668",
+            target_device=sabotaged_device
+        )
+        
+        # 3. Verify rollback
+        status = controller.wait_for_completion(cycle_id, timeout=300)
+        
+        assert status["overall_status"] == "rollback"
+        assert sabotaged_device.config_restored_to_backup() == True
+        assert controller.rollback_logs_contain(cycle_id, "Remediation Applier") == True
+    
+    def test_llm_fallback_mechanism(self):
+        """Test fallback operation during LLM failure"""
+        
+        # 1. Disable ML service
+        ml_service.stop()
+        
+        # 2. Start cycle
+        controller = CycleController()
+        cycle_id = controller.start_cycle(...)
+        
+        # 3. Verify fallback rules usage
+        artifacts = controller.get_artifacts(cycle_id)
+        analysis_artifact = artifacts.get_by_type("llm_analysis")
+        
+        # Should use rule-based analyzer
+        assert analysis_artifact["generator"] == "rule_based_fallback"
+        assert analysis_artifact["contains_finding"] == True
+        
+        # 4. Verify cycle completion
+        status = controller.wait_for_completion(cycle_id)
+        assert status["overall_status"] == "completed"
+
+M.2.2. Module Interaction Tests
+python
+
+# tests/test_module_integration.py
+class TestModuleIntegration:
+    
+    def test_attack_analyst_to_executor_flow(self):
+        """Test attack plan handoff from Analyst to Executor"""
+        
+        # 1. Analyst generates plan
+        analyst = AttackAnalyst()
+        config = get_test_device_config()
+        analysis = analyst.analyze(config, stig_id="V-220668")
+        
+        # 2. Verify plan structure
+        assert "attack_plan" in analysis
+        assert "steps" in analysis["attack_plan"]
+        assert len(analysis["attack_plan"]["steps"]) > 0
+        
+        # 3. Executor executes plan
+        executor = AttackExecutor()
+        result = executor.execute(analysis["attack_plan"])
+        
+        # 4. Verify results
+        assert "attack_successful" in result
+        assert "evidence" in result
+        assert "timestamp" in result
+        
+        # 5. Verify expectations match
+        if analysis["findings"][0]["severity"] == "medium":
+            assert result["attack_successful"] == True
+    
+    def test_remediation_synthesis_and_application(self):
+        """Test remediation synthesis and application"""
+        
+        # 1. Prepare data
+        vulnerability = {
+            "stig_id": "V-220668",
+            "description": "Interface Gi2 in default VLAN 1",
+            "affected_component": "GigabitEthernet2"
+        }
+        
+        attack_report = {
+            "attack_successful": True,
+            "evidence": "ping succeeded to 192.168.1.100"
+        }
+        
+        # 2. Synthesize remediation
+        synthesizer = RemediationSynthesizer()
+        patch = synthesizer.generate(
+            vulnerability=vulnerability,
+            context=attack_report
+        )
+        
+        # 3. Validate syntax
+        assert patch.validate_syntax() == True
+        assert "interface GigabitEthernet2" in patch.commands
+        assert "switchport access vlan 100" in patch.commands
+        
+        # 4. Apply (dry-run)
+        applier = RemediationApplier(dry_run=True)
+        apply_result = applier.apply(patch, target_device)
+        
+        # 5. Verify
+        assert apply_result["success"] == True
+        assert apply_result["validation_passed"] == True
+        assert apply_result["rollback_prepared"] == True
+    
+    def test_evidence_chain_integrity(self):
+        """Test evidence chain integrity"""
+        
+        # 1. Collect test cycle artifacts
+        artifacts = [
+            Artifact(type="config", data=initial_config, hash=sha256(initial_config)),
+            Artifact(type="analysis", data=analysis_report, hash=sha256(analysis_report)),
+            Artifact(type="attack", data=attack_result, hash=sha256(attack_result)),
+            Artifact(type="remediation", data=patch, hash=sha256(patch)),
+            Artifact(type="verification", data=verification, hash=sha256(verification))
+        ]
+        
+        # 2. Build Merkle Tree
+        merkle_builder = MerkleTreeBuilder()
+        tree = merkle_builder.build(artifacts)
+        
+        # 3. Verify integrity
+        for artifact in artifacts:
+            proof = tree.get_proof(artifact.hash)
+            assert merkle_builder.verify_proof(
+                leaf_hash=artifact.hash,
+                proof=proof,
+                root_hash=tree.root
+            ) == True
+        
+        # 4. Sign and verify
+        signer = DigitalSigner()
+        signature = signer.sign(tree.root)
+        
+        assert signer.verify(tree.root, signature) == True
+
+M.3. Test Scenarios
+
+M.3.1. Test Scenario Table
+yaml
+
+test_scenarios:
+  - id: "SCENARIO-001"
+    name: "Successful vulnerability detection and remediation"
+    preconditions:
+      - "Device has port in VLAN 1"
+      - "Target host accessible in VLAN 1"
+    steps:
+      - "Start cycle with STIG V-220668"
+      - "Wait for completion"
+    expected_results:
+      - "Cycle completed with status 'completed'"
+      - "Report contains digital signature"
+      - "Port moved to VLAN 100"
+      - "Follow-up attack unsuccessful"
+    
+  - id: "SCENARIO-002"
+    name: "False positive handling"
+    preconditions:
+      - "Device does NOT have ports in VLAN 1"
+      - "LLM configured for high sensitivity"
+    steps:
+      - "Start cycle with STIG V-220668"
+      - "Monitor logs"
+    expected_results:
+      - "Attack Analyst does not detect vulnerability"
+      - "Cycle ends early with appropriate status"
+      - "Logs contain entry about check and no findings"
+    
+  - id: "SCENARIO-003"
+    name: "Network failure recovery"
+    preconditions:
+      - "Cycle started"
+      - "Network connection to device unstable"
+    steps:
+      - "Simulate network outage during analysis"
+      - "Restore network after 60 seconds"
+    expected_results:
+      - "System performs retry (up to 3 attempts)"
+      - "On failure - clean rollback"
+      - "Logs contain timeout and retry entries"
+    
+  - id: "SCENARIO-004"
+    name: "ML service failure handling"
+    preconditions:
+      - "ML service unstable"
+      - "Fallback rules configured"
+    steps:
+      - "Stop ML service during analysis"
+      - "Monitor system response"
+    expected_results:
+      - "System switches to rule-based analyzer"
+      - "Cycle completes successfully (possibly with degraded accuracy)"
+      - "Logs contain warning about fallback activation"
+    
+  - id: "SCENARIO-005"
+    name: "Performance testing under load"
+    preconditions:
+      - "System deployed in production configuration"
+      - "10 virtual devices ready for testing"
+    steps:
+      - "Parallel launch of 10 cycles"
+      - "Monitor metrics for 2 hours"
+    expected_results:
+      - "All cycles complete within 120 minutes"
+      - "GPU utilization does not exceed 80%"
+      - "No more than 5% of cycles require rollback"
+      - "Average cycle time < 90 minutes"
+
+M.3.2. Test Scenario Execution Script
+python
+
+#!/usr/bin/env python3
+"""
+test-scenario-runner.py - Execute test scenarios
+"""
+
+import yaml
+import asyncio
+from dataclasses import dataclass
+from typing import Dict, List
+from enum import Enum
+
+class TestStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    PASSED = "passed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+@dataclass
+class TestResult:
+    scenario_id: str
+    status: TestStatus
+    duration: float
+    logs: List[str]
+    artifacts: Dict
+
+class TestScenarioRunner:
+    def __init__(self, scenarios_file: str):
+        with open(scenarios_file, 'r') as f:
+            self.scenarios = yaml.safe_load(f)['test_scenarios']
+        
+        self.results = []
+    
+    async def run_scenario(self, scenario: Dict) -> TestResult:
+        """Execute single test scenario"""
+        result = TestResult(
+            scenario_id=scenario['id'],
+            status=TestStatus.RUNNING,
+            duration=0.0,
+            logs=[],
+            artifacts={}
+        )
+        
+        try:
+            # Prepare environment
+            await self.setup_environment(scenario['preconditions'])
+            
+            # Execute steps
+            start_time = asyncio.get_event_loop().time()
+            
+            for step in scenario['steps']:
+                await self.execute_step(step, result)
+            
+            result.duration = asyncio.get_event_loop().time() - start_time
+            
+            # Verify expected results
+            await self.verify_results(scenario['expected_results'], result)
+            
+            result.status = TestStatus.PASSED
+            
+        except Exception as e:
+            result.status = TestStatus.FAILED
+            result.logs.append(f"ERROR: {str(e)}")
+        
+        finally:
+            await self.cleanup()
+        
+        return result
+    
+    async def run_all_scenarios(self):
+        """Execute all scenarios"""
+        print(f"🚀 Executing {len(self.scenarios)} test scenarios")
+        
+        for scenario in self.scenarios:
+            print(f"\n📋 Executing scenario: {scenario['name']}")
+            
+            result = await self.run_scenario(scenario)
+            self.results.append(result)
+            
+            print(f"   Status: {result.status.value}")
+            print(f"   Duration: {result.duration:.2f} seconds")
+        
+        # Generate report
+        self.generate_report()
+    
+    def generate_report(self):
+        """Generate final report"""
+        passed = sum(1 for r in self.results if r.status == TestStatus.PASSED)
+        failed = sum(1 for r in self.results if r.status == TestStatus.FAILED)
+        
+        report = {
+            "summary": {
+                "total": len(self.results),
+                "passed": passed,
+                "failed": failed,
+                "success_rate": (passed / len(self.results)) * 100
+            },
+            "detailed_results": [
+                {
+                    "scenario_id": r.scenario_id,
+                    "status": r.status.value,
+                    "duration": r.duration,
+                    "log_count": len(r.logs)
+                }
+                for r in self.results
+            ]
+        }
+        
+        # Save report
+        with open('/tmp/test_execution_report.json', 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        print(f"\n📊 Final Report:")
+        print(f"   Successful: {passed}/{len(self.results)}")
+        print(f"   Success rate: {report['summary']['success_rate']:.1f}%")
+        print(f"   Report saved: /tmp/test_execution_report.json")
+
+async def main():
+    runner = TestScenarioRunner('test_scenarios.yml')
+    await runner.run_all_scenarios()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+M.4. Continuous Integration and Testing
+
+M.4.1. GitHub Actions Configuration
+yaml
+
+# .github/workflows/ci-cd.yml
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Run unit tests
+        run: |
+          docker compose -f docker-compose.test.yml run --rm test-runner \
+            pytest tests/unit/ -v --cov=zero1 --cov-report=xml
+      
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+  
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Run integration tests
+        run: |
+          docker compose -f docker-compose.test.yml up -d
+          docker compose -f docker-compose.test.yml run --rm test-runner \
+            pytest tests/integration/ -v
+      
+      - name: Test report
+        if: always()
+        run: |
+          cat /tmp/test_execution_report.json
+  
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Run security scan
+        run: |
+          docker scan zero1-controller:latest --severity high
+          docker scan zero1-ml-service:latest --severity high
+      
+      - name: STIG compliance check
+        run: |
+          python scripts/compliance_check.py --profile stig
+
+  performance-tests:
+    runs-on: [self-hosted, gpu]
+    needs: security-scan
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Run performance tests
+        run: |
+          locust -f tests/performance/locustfile.py \
+            --host=http://localhost:8000 \
+            --users=10 \
+            --spawn-rate=1 \
+            --run-time=1h \
+            --csv=performance_results
+      
+      - name: Upload performance report
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-report
+          path: performance_results*.csv
+
+M.4.2. Code Quality and Standards
+yaml
+
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+  
+  - repo: https://github.com/psf/black
+    rev: 23.3.0
+    hooks:
+      - id: black
+        language_version: python3.11
+  
+  - repo: https://github.com/PyCQA/flake8
+    rev: 6.0.0
+    hooks:
+      - id: flake8
+        additional_dependencies: [flake8-docstrings]
+  
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.12.0
+    hooks:
+      - id: isort
+  
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.3.0
+    hooks:
+      - id: mypy
+        additional_dependencies: [types-requests, types-PyYAML]
+  
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v3.5.3
+    hooks:
+      - id: commitizen
+        stages: [commit-msg]
+
+Final Analysis of Created Sections:
+
+    Coverage Completeness
+
+    The created sections complement the existing documentation by providing:
+
+        Operational readiness through troubleshooting guide
+
+        Regulatory compliance through security policies
+
+        Reliability and quality through integration tests
+
+    Architectural Consistency
+
+    All sections:
+
+        Reference existing system components
+
+        Utilize technologies and tools defined in the SOW
+
+        Comply with stated requirements and constraints
+
+    Practical Applicability
+
+        Troubleshooting guide contains specific commands and procedures
+
+        Security policies are implementable and verifiable
+
+        Test scenarios cover all critical system paths
+
+    Scalability
+
+        Diagnostic procedures can be extended for new modules
+
+        Security policies can be adapted to new compliance requirements
+
+        Test infrastructure supports addition of new scenarios
