@@ -1,0 +1,677 @@
+
+
+
+Appendix D: Детальные схемы базы данных для артефактов и логов
+
+Общая концепция: Для обеспечения целостности, производительности и удобства аудита данные разделены на две логические базы:
+
+    Операционная база (Operational DB - PostgreSQL): Для структурированных метаданных, состояния заданий и ссылок на артефакты.
+
+    Хранилище артефактов и логов (Object Storage & Time-Series DB): Для хранения больших бинарных и текстовых объектов (снапшоты, конфиги, сырые логи) и потоковых событий.
+
+D.1. Схема операционной базы данных (PostgreSQL 16)
+
+D.1.1. Таблица test_cycles
+Хранит метаданные каждого полного цикла выполнения.
+sql
+
+CREATE TABLE test_cycles (
+    cycle_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    stig_id VARCHAR(20) NOT NULL, -- e.g., 'V-220668'
+    target_device_model VARCHAR(50) NOT NULL, -- e.g., 'Cisco CSR1000v'
+    target_device_ip INET NOT NULL,
+    lab_snapshot_hash VARCHAR(64), -- SHA-256 снапшота EVE-NG
+    start_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    end_time TIMESTAMPTZ,
+    overall_status VARCHAR(20) NOT NULL DEFAULT 'running' CHECK (overall_status IN ('running', 'completed', 'failed', 'rollback')),
+    merkle_root VARCHAR(64), -- Корень Merkle Tree цикла
+    digital_signature TEXT, -- Подпись от YubiKey
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_cycles_status ON test_cycles(overall_status);
+CREATE INDEX idx_cycles_time ON test_cycles(start_time);
+
+D.1.2. Таблица cycle_stages
+Логирует каждый этап выполнения цикла для отслеживания и отладки.
+sql
+
+CREATE TABLE cycle_stages (
+    stage_id BIGSERIAL PRIMARY KEY,
+    cycle_id UUID NOT NULL REFERENCES test_cycles(cycle_id) ON DELETE CASCADE,
+    stage_name VARCHAR(50) NOT NULL CHECK (stage_name IN (
+        'lab_init', 'discovery', 'attack_plan', 'attack_exec',
+        'remediation_gen', 'remediation_apply', 'verification', 'report_gen'
+    )),
+    start_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    end_time TIMESTAMPTZ,
+    status VARCHAR(20) NOT NULL DEFAULT 'started' CHECK (status IN ('started', 'success', 'failed')),
+    error_message TEXT,
+    artifact_references JSONB, -- Ссылки на артефакты этапа
+    CONSTRAINT fk_cycle_stage FOREIGN KEY (cycle_id) REFERENCES test_cycles(cycle_id)
+);
+CREATE INDEX idx_stages_cycle ON cycle_stages(cycle_id);
+CREATE INDEX idx_stages_name ON cycle_stages(stage_name);
+
+D.1.3. Таблица artifacts_registry
+Центральный реестр всех созданных артефактов с криптографическими хэшами.
+sql
+
+CREATE TABLE artifacts_registry (
+    artifact_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cycle_id UUID NOT NULL REFERENCES test_cycles(cycle_id) ON DELETE CASCADE,
+    stage_id BIGINT NOT NULL REFERENCES cycle_stages(stage_id),
+    artifact_type VARCHAR(30) NOT NULL CHECK (artifact_type IN (
+        'raw_config', 'parsed_config', 'llm_analysis', 'attack_plan',
+        'execution_log', 'remediation_patch', 'applied_config',
+        'verification_log', 'merkle_proof', 'final_report'
+    )),
+    storage_backend VARCHAR(20) NOT NULL DEFAULT 's3' CHECK (storage_backend IN ('s3', 'elasticsearch')),
+    storage_path TEXT NOT NULL, -- Путь в S3 или ID в Elasticsearch
+    sha256_hash VARCHAR(64) NOT NULL, -- Контрольная сумма содержимого
+    metadata JSONB, -- Доп. метаданные (размер, MIME-тип и т.д.)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT unique_hash_per_cycle UNIQUE (cycle_id, sha256_hash)
+);
+CREATE INDEX idx_artifacts_cycle ON artifacts_registry(cycle_id);
+CREATE INDEX idx_artifacts_type ON artifacts_registry(artifact_type);
+CREATE INDEX idx_artifacts_hash ON artifacts_registry(sha256_hash);
+
+D.1.4. Таблица rollback_logs
+Детальный журнал всех операций отката.
+sql
+
+CREATE TABLE rollback_logs (
+    rollback_id BIGSERIAL PRIMARY KEY,
+    cycle_id UUID NOT NULL REFERENCES test_cycles(cycle_id),
+    triggered_by_stage VARCHAR(50) NOT NULL,
+    trigger_error TEXT NOT NULL,
+    rollback_actions JSONB NOT NULL, -- Массив выполненных действий отката
+    rollback_status VARCHAR(20) NOT NULL CHECK (rollback_status IN ('success', 'partial', 'failed')),
+    start_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    end_time TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+D.2. Схема хранилища артефактов (MinIO S3)
+
+Используется объектная структура, оптимизированная для версионности и поиска:
+text
+
+s3://zero1-artifacts/
+├── cycles/
+│   ├── {cycle_id}/
+│   │   ├── 01_lab/
+│   │   │   ├── eve-ng-snapshot.qcow2
+│   │   │   └── initial-config.cfg
+│   │   ├── 02_discovery/
+│   │   │   ├── show-run-raw.txt
+│   │   │   ├── show-vlan-parsed.json
+│   │   │   └── llm-analysis.json
+│   │   ├── 03_attack/
+│   │   │   ├── attack-plan.json
+│   │   │   └── execution-log.jsonl
+│   │   ├── 04_remediation/
+│   │   │   ├── generated-patch.txt
+│   │   │   ├── backup-config.cfg
+│   │   │   └── application-log.json
+│   │   └── 05_verification/
+│   │       ├── reattack-plan.json
+│   │       └── verification-result.json
+└── proofs/
+    └── {cycle_id}/
+        ├── merkle-tree.json
+        └── signed-report.json
+
+D.3. Схема хранения логов и событий (Elasticsearch 8.11)
+
+D.3.1. Индекс для структурированных логов приложений (zero1-app-logs-*)
+json
+
+{
+  "mappings": {
+    "properties": {
+      "@timestamp": { "type": "date" },
+      "cycle_id": { "type": "keyword" },
+      "stage": { "type": "keyword" },
+      "log_level": { "type": "keyword" },
+      "component": { "type": "keyword" },
+      "message": { "type": "text" },
+      "execution_time_ms": { "type": "long" },
+      "device_ip": { "type": "ip" },
+      "error_stack": { "type": "text" },
+      "custom_fields": { "type": "flattened" }
+    }
+  }
+}
+
+D.3.2. Индекс для сетевых событий и телеметрии (zero1-net-events-*)
+json
+
+{
+  "mappings": {
+    "properties": {
+      "@timestamp": { "type": "date" },
+      "cycle_id": { "type": "keyword" },
+      "event_type": { "type": "keyword" },
+      "src_ip": { "type": "ip" },
+      "dst_ip": { "type": "ip" },
+      "protocol": { "type": "keyword" },
+      "vlan": { "type": "keyword" },
+      "interface": { "type": "keyword" },
+      "action": { "type": "keyword" },
+      "success": { "type": "boolean" },
+      "packet_count": { "type": "long" }
+    }
+  }
+}
+
+D.3.3. Индекс для правил Kibana Alerting
+Предопределенные правила для автоматического детектирования:
+
+    attack-success — срабатывает при появлении события с event_type: "connectivity_test" AND success: true AND vlan: "1"
+
+    remediation-applied — срабатывает при event_type: "config_change" AND action: "remediation"
+
+    verification-pass — срабатывает, если после remediation-applied в течение 300 секунд НЕ появилось attack-success
+
+Appendix E: Полные Dockerfile и docker-compose.yml для всех сервисов
+E.1. Базовый образ для Python-сервисов (Dockerfile.python-base)
+dockerfile
+
+FROM python:3.11-slim
+WORKDIR /app
+
+# Установка системных зависимостей
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    libpq-dev \
+    netcat-traditional \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копирование зависимостей
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Создание непривилегированного пользователя
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+CMD ["python", "main.py"]
+
+E.2. Контроллер цикла (Dockerfile.controller)
+dockerfile
+
+FROM zero1-python-base:latest as builder
+WORKDIR /app
+COPY controller/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+FROM python:3.11-slim
+WORKDIR /app
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY controller/ .
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+E.3. ML-сервис для анализа и синтеза (Dockerfile.ml-service)
+dockerfile
+
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+WORKDIR /app
+
+# Установка Python и системных зависимостей
+RUN apt-get update && apt-get install -y \
+    python3.11 \
+    python3.11-dev \
+    python3-pip \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копирование моделей и кода
+COPY ml-service/requirements.txt .
+RUN pip3 install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Загрузка предобученных моделей
+RUN curl -L -o /app/models/llama-3.1-8b-ft.tar.gz https://storage.example.com/models/llama-3.1-8b-ft.tar.gz \
+    && tar -xzf /app/models/llama-3.1-8b-ft.tar.gz -C /app/models/ \
+    && rm /app/models/llama-3.1-8b-ft.tar.gz
+
+COPY ml-service/ .
+
+EXPOSE 8080
+CMD ["python3", "serve_models.py", "--port", "8080", "--model-dir", "/app/models"]
+
+E.4. Полный файл docker-compose.yml
+yaml
+
+version: '3.8'
+
+services:
+  # База данных
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: zero1
+      POSTGRES_USER: zero1
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - zero1-backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zero1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Хранилище артефактов
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - zero1-backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # Elastic Stack для логов
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+    volumes:
+      - elastic_data:/usr/share/elasticsearch/data
+    networks:
+      - zero1-backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  kibana:
+    image: kibana:8.11.0
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    networks:
+      - zero1-backend
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # Основные сервисы приложения
+  zero1-controller:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+    environment:
+      - DATABASE_URL=postgresql://zero1:${DB_PASSWORD}@postgres:5432/zero1
+      - MINIO_ENDPOINT=minio:9000
+      - ML_SERVICE_URL=http://ml-service:8080
+    volumes:
+      - ./config:/app/config:ro
+      - yubikey_data:/var/yubikey
+    networks:
+      - zero1-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+  ml-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.ml-service
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - MODEL_CACHE_SIZE=20
+    volumes:
+      - ./models:/app/models:ro
+    networks:
+      - zero1-backend
+
+  # Сервис верификации и сбора логов
+  verifier:
+    build:
+      context: .
+      dockerfile: Dockerfile.python-base
+    environment:
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    volumes:
+      - ./verifier:/app
+    networks:
+      - zero1-backend
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # Мониторинг
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - zero1-backend
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+    volumes:
+      - ./monitoring/dashboards:/etc/grafana/provisioning/dashboards
+    networks:
+      - zero1-backend
+
+volumes:
+  postgres_data:
+  minio_data:
+  elastic_data:
+  prometheus_data:
+  yubikey_data:
+
+networks:
+  zero1-backend:
+    driver: bridge
+
+Appendix F: Пошаговые сценарии отката (rollback) для каждого модуля
+F.1. Общий протокол отката
+
+    Детекция ошибки: Модуль возвращает код ошибки > 0 или превышает таймаут.
+
+    Логирование: Ошибка записывается в rollback_logs с полным контекстом.
+
+    Выполнение отката: Запускается специфичный для модуля скрипт отката.
+
+    Верификация: Проверяется успешность отката.
+
+    Эскалация: При неудаче отката — уведомление оператора и остановка цикла.
+
+F.2. Детальные сценарии по модулям
+
+F.2.1. Модуль лаборатории (Lab Manager)
+
+    Триггер: Не удалось развернуть лабораторию за 25 минут.
+
+    Процедура отката:
+    bash
+
+# 1. Остановить все ноды в EVE-NG
+eve-cli node stop --all --lab zero1-mvp
+
+# 2. Удалить лабораторию
+eve-cli lab delete --name zero1-mvp --force
+
+# 3. Очистить временные файлы
+rm -rf /opt/eve-ng/labs/zero1-mvp
+
+# 4. Перезапустить службу EVE-NG
+systemctl restart eve-ng
+
+# 5. Верификация: проверить доступность EVE-NG API
+curl -f http://eve-ng:8080/api/status
+
+    Критерий успеха: EVE-NG API возвращает {"status": "ready"}.
+
+F.2.2. Модуль Attack Executor
+
+    Триггер: Атака вызвала критическую ошибку на целевом устройстве (например, перезагрузка).
+
+    Процедура отката:
+    bash
+
+# 1. Восстановить снапшот устройства
+eve-cli node restore --node CSR1000v --snapshot pre-test-snapshot
+
+# 2. Перезагрузить устройство
+ssh admin@csr1000v "reload in 1\n"
+
+# 3. Ожидать восстановления (3 минуты)
+sleep 180
+
+# 4. Верификация: проверка доступности по SSH
+nc -z -w 5 csr1000v 22
+
+    Критерий успеха: Устройство доступно по SSH в течение 5 секунд.
+
+F.2.3. Модуль Remediation Applier
+
+    Триггер: Применение патча привело к потере управления устройством.
+
+    Процедура отката (автоматический откат конфигурации):
+    bash
+
+# 1. Загрузить сохраненный бэкап конфигурации
+ssh admin@csr1000v "copy tftp://backup-server/backup_pre_remediation.cfg running-config"
+
+# 2. Сохранить конфигурацию
+ssh admin@csr1000v "write memory"
+
+# 3. Принудительная перезагрузка (если предыдущие шаги не сработали)
+eve-cli node reboot --node CSR1000v --force
+
+# 4. Верификация: проверить, что порт вернулся в VLAN 1
+OUTPUT=$(ssh admin@csr1000v "show run interface Gi2")
+echo "$OUTPUT" | grep -q "switchport access vlan 1"
+
+    Критерий успеха: Конфигурация интерфейса содержит switchport access vlan 1.
+
+F.2.4. Модуль Evidence Generator
+
+    Триггер: Не удалось сгенерировать цифровую подпись.
+
+    Процедура отката:
+    bash
+
+# 1. Создать неподписанный отчет
+python generate_report.py --no-signature --output /tmp/unsigned_report.json
+
+# 2. Уведомить оператора
+send_alert "CRITICAL: Failed to sign report for cycle ${CYCLE_ID}"
+
+# 3. Сохранить необработанные данные для последующего анализа
+tar -czf /backup/raw_cycle_${CYCLE_ID}.tar.gz /tmp/zero1_artifacts/
+
+    Критерий успеха: Неподписанный отчет сохранен, оператор уведомлен.
+
+F.3. Матрица эскалации откатов
+Уровень	Тип ошибки	Действие	Таймаут
+Уровень 1	Временная сетевая ошибка	3 повторные попытки	30 секунд
+Уровень 2	Ошибка приложения	Откат модуля	5 минут
+Уровень 3	Критическая ошибка устройства	Полный откат лаборатории, уведомление	15 минут
+Уровень 4	Неустранимая ошибка	Остановка цикла, создание дампа для анализа	Немедленно
+Appendix G: План нагрузочного тестирования пайплайна
+G.1. Цели тестирования
+
+    Определить пропускную способность системы (циклов/час).
+
+    Выявить узкие места в пайплайне.
+
+    Определить максимальную нагрузку до деградации сервисов.
+
+    Проверить стабильность при длительной работе (24+ часа).
+
+G.2. Методология
+
+Использование Locust для имитации нагрузки и Prometheus+Grafana для сбора метрик.
+
+Конфигурация Locust (locustfile.py):
+python
+
+from locust import HttpUser, task, between
+import uuid
+
+class ZeroOneUser(HttpUser):
+    wait_time = between(1, 3)
+    
+    @task(1)
+    def start_full_cycle(self):
+        cycle_id = str(uuid.uuid4())
+        # Запуск полного цикла
+        self.client.post("/api/v1/cycle/start", 
+            json={
+                "cycle_id": cycle_id,
+                "target": "csr1000v-1",
+                "stig_id": "V-220668"
+            },
+            name="Start Cycle"
+        )
+        
+        # Мониторинг статуса каждые 30 секунд
+        for _ in range(20):  # Максимум 10 минут ожидания
+            response = self.client.get(f"/api/v1/cycle/{cycle_id}/status")
+            if response.json()["status"] in ["completed", "failed"]:
+                break
+            time.sleep(30)
+    
+    @task(3)
+    def start_analysis_only(self):
+        # Тестирование только фазы анализа
+        self.client.post("/api/v1/attack/analyze",
+            json={"target": "csr1000v-2"},
+            name="Analyze Only"
+        )
+
+G.3. Этапы нагрузочного тестирования
+
+Этап 1: Базовое тестирование (1 час)
+
+    Нагрузка: 1 цикл каждые 10 минут
+
+    Метрики:
+
+        Время выполнения каждого этапа
+
+        Использование CPU/GPU
+
+        Потребление памяти
+
+        Загрузка сети
+
+Этап 2: Постепенное увеличение нагрузки (4 часа)
+yaml
+
+Нагрузочные сценарии:
+  1-й час: 5 циклов/час
+  2-й час: 10 циклов/час  
+  3-й час: 20 циклов/час
+  4-й час: 30 циклов/час
+
+    Цель: Найти точку, где время отклика увеличивается на 50%
+
+Этап 3: Пиковая нагрузка (2 часа)
+
+    Нагрузка: 50 циклов/час (максимальная теоретическая пропускная способность)
+
+    Мониторинг:
+
+        Очереди в PostgreSQL
+
+        Задержки в Elasticsearch
+
+        Ошибки таймаутов
+
+Этап 4: Выносливость (24 часа)
+
+    Нагрузка: 15 циклов/час (стабильный уровень)
+
+    Цель: Проверить утечки памяти, фрагментацию диска, накопление логов
+
+G.4. Ключевые метрики и целевые значения
+yaml
+
+Метрики производительности:
+  p95_цикла: < 90 минут  # 95-й перцентиль
+  p99_анализа: < 120 секунд
+  успешность_циклов: > 95%
+  загрузка_gpu: < 80%
+  загрузка_ram: < 85%
+  latency_базы: < 100 мс
+
+Метрики надежности:
+  ошибки_таймаута: < 1%
+  автоматические_откаты: < 5%
+  потерянные_артефакты: 0
+
+G.5. Инструменты мониторинга
+
+    Инфраструктура: node_exporter на всех хостах
+
+    База данных: postgres_exporter
+
+    Приложение: Кастомные метрики Prometheus в каждом модуле
+
+    Логи: Централизованный сбор в Elasticsearch
+
+    Дашборды:
+
+        Обзор системы
+
+        Детализация циклов
+
+        Анализ ошибок
+
+G.6. Критерии успеха тестирования
+
+    Система обрабатывает 15 циклов/час без деградации сервисов
+
+    95% циклов завершаются успешно
+
+    Автоматические откаты срабатывают менее чем для 5% операций
+
+    Время восстановления после сбоя < 10 минут
+
+    Потребление памяти стабильно в течение 24 часов
+
+G.7. План действий по результатам тестирования
+
+graph TD
+    A[Начало нагрузочного тестирования] --> B{Анализ результатов};
+    B --> C[Этап 1: Масштабирование<br/>базы данных];
+    B --> D[Этап 2: Оптимизация<br/>запросов LLM];
+    B --> E[Этап 3: Улучшение<br/>кэширования];
+    
+    C --> C1[Добавление реплик<br/>PostgreSQL];
+    C --> C2[Шардирование<br/>артефактов];
+    
+    D --> D1[Оптимизация промптов];
+    D --> D2[Кэширование<br/>результатов LLM];
+    
+    E --> E1[Кэш конфигураций<br/>устройств];
+    E --> E2[Предварительная<br/>загрузка моделей];
+    
+    C1 --> F[Повторное тестирование];
+    D1 --> F;
+    E1 --> F;
+    
+    F --> G{Достигнуты цели?};
+    G -->|Да| H[Готово к продакшену];
+    G -->|Нет| B;
+
+Примечание: Все тесты выполняются на изолированном стенде, идентичном продакшену, но без доступа к реальным сетевым устройствам. Используются виртуальные CSR1000v в количестве 10 штук для имитации различных целей.
