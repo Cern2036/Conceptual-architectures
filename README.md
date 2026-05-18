@@ -55,4 +55,4 @@ This work is licensed under [Creative Commons Attribution-NonCommercial 4.0 Inte
 
 ## Author
 
-**Evgenii Nazarov** (@Cern2036)
+**Cern2036**
