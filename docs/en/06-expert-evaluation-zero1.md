@@ -1,3 +1,8 @@
+---
+title: 06 Expert Evaluation Zero1
+lang: en
+---
+
 Expert Evaluation of Project ZERO-1: Industrial Readiness Analysis
 1. System Strengths
 1.1. Comprehensive Approach

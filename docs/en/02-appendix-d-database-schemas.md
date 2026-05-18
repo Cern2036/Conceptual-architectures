@@ -1,3 +1,8 @@
+---
+title: 02 Appendix D Database Schemas
+lang: en
+---
+
 Appendix D: Detailed Database Schemas for Artifacts and Logs
 
 General Concept: To ensure integrity, performance, and ease of audit, data is divided into two logical databases:

@@ -1,3 +1,8 @@
+---
+title: 07 Zero1 Can Ai Automate Hardening
+lang: en
+---
+
 ZERO-1: Can AI Automate Network Equipment Hardening?
 
 Introduction: Why is Hardening Still Manual?

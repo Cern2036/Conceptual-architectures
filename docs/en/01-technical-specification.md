@@ -1,3 +1,8 @@
+---
+title: 01 Technical Specification
+lang: en
+---
+
 Technical Specification
 
 Project ZERO-1: Prototype of an Autonomous Coevolutionary Hardening Loop for Network Equipment

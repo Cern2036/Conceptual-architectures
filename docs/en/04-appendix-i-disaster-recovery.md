@@ -1,3 +1,8 @@
+---
+title: 04 Appendix I Disaster Recovery
+lang: en
+---
+
 Appendix I: Disaster Recovery Plans
 I.1. Incident Classification
 Level	Description	Recovery Time Objective (RTO)	Recovery Point Objective (RPO)

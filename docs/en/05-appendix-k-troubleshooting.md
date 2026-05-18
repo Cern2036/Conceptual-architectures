@@ -1,156 +1,171 @@
-Appendix K: Инструкции по устранению неисправностей (Troubleshooting Guide)
-K.1. Общая методология диагностики
-K.1.1. Диагностическое дерево решений
+---
+title: 05 Appendix K Troubleshooting
+lang: en
+---
+
+Appendix K: Troubleshooting Guide
+
+K.1. General Diagnostic Methodology
+
+K.1.1. Diagnostic Decision Tree
 text
 
-Проблема обнаружена → Проверить логи Kibana (http://localhost:5601) → 
-→ Идентифицировать модуль-источник → 
-→ Проверить метрики в Grafana → 
-→ Свериться с таблицей распространенных проблем (K.2) → 
-→ Применить специфичное решение
+Problem Detected → Check Kibana Logs (http://localhost:5601) →
+→ Identify Source Module →
+→ Check Metrics in Grafana →
+→ Consult Common Issues Table (K.2) →
+→ Apply Specific Solution
 
-K.1.2. Ключевые команды диагностики
+K.1.2. Key Diagnostic Commands
 bash
 
-# 1. Общий статус системы
+# 1. Overall System Status
 ./manage-system.sh status
 
-# 2. Проверка логов последних ошибок
+# 2. Check Recent Error Logs
 docker compose logs --tail=50 --timestamps | grep -E "(ERROR|FAILED|exception|timeout)"
 
-# 3. Проверка здоровья всех сервисов
+# 3. Check Health of All Services
 curl -s http://localhost:8000/api/v1/health | jq .
 curl -s http://localhost:8080/health | jq .
 curl -f http://localhost:9000/minio/health/live
 curl -f http://localhost:9200/_cluster/health
 
-# 4. Проверка дискового пространства
+# 4. Check Disk Space
 df -h /var/lib/docker/
 
-# 5. Проверка использования GPU
+# 5. Check GPU Usage
 nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv
 
-K.2. Таблица распространенных проблем и решений
-K.2.1. Проблемы развертывания лаборатории
-Симптом	Возможная причина	Решение
-Ошибка Lab initialization timeout в логах контроллера	EVE-NG API недоступен	1. Проверить статус EVE-NG: systemctl status eve-ng
-2. Проверить сетевую связность: ping <eve-ng-ip>
-3. Перезапустить EVE-NG: systemctl restart eve-ng
-Terraform не может создать лабораторию	Недостаточно ресурсов на хосте EVE-NG	1. Проверить свободную память: free -h
-2. Проверить доступные образы в EVE-NG
-3. Увеличить лимиты памяти для виртуальных машин
-Ansible не может подключиться к CSR1000v	Неправильные учетные данные или сетевые ACL	1. Проверить учетные данные в HashiCorp Vault
-2. Проверить доступность CSR1000v по SSH с хоста управления
-3. Проверить настройки firewall в EVE-NG
-K.2.2. Проблемы модуля Attack Analyst
-Симптом	Возможная причина	Решение
-LLM возвращает пустой или некорректный JSON	Проблема с промпт-инжинирингом или моделью	1. Проверить логи ML-сервиса: docker compose logs ml-service
-2. Проверить валидность входных данных
-3. Перезапустить модель: curl -X POST http://ml-service:8080/models/reload
-Netmiko таймаут при подключении к устройству	Проблемы с сетью или устройством	1. Проверить доступность устройства: nc -zv <device-ip> 22
-2. Увеличить таймауты в конфигурации Netmiko
-3. Проверить нагрузку на устройстве (CPU)
-Парсер TextFSM не обрабатывает вывод CLI	Несоответствие шаблона	1. Проверить актуальность шаблонов NTC
-2. Добавить raw вывод в лог для анализа
-3. Использовать fallback-регулярные выражения
-K.2.3. Проблемы модуля Attack Executor
-Симптом	Возможная причина	Решение
-Ping не проходит, хотя уязвимость существует	Проблемы с сетевым стеком в EVE-NG	1. Проверить ARP таблицу на CSR1000v
-2. Проверить VLAN назначения на коммутаторе
-3. Проверить firewall правила на Ubuntu VM
-SSH подключение к атакующему хосту падает	Проблемы с ресурсами виртуальной машины	1. Увеличить память для VM в EVE-NG
-2. Проверить нагрузку на хосте EVE-NG
-3. Пересоздать VM из шаблона
-K.2.4. Проблемы модуля Remediation
-Симптом	Возможная причина	Решение
-Сгенерированные команды вызывают ошибку на устройстве	Синтаксическая ошибка или неподдерживаемая команда	1. Проверить версию IOS и синтаксис команд
-2. Включить dry-run режим для валидации
-3. Использовать show parser dump для отладки
-Применение патча вызывает потерю управления	Конфликтующая конфигурация	1. Автоматический откат должен сработать (проверить rollback_logs)
-2. Проверить снапшот устройства в EVE-NG
-3. Восстановить из бэкапа вручную
-K.2.5. Проблемы производительности
-Симптом	Возможная причина	Решение
-Время цикла превышает 120 минут	Загрузка GPU или сетевые задержки	1. Проверить утилизацию GPU: nvidia-smi
-2. Оптимизировать промпты для уменьшения времени инференса
-3. Кэшировать результаты анализа для идентичных конфигураций
-Высокая загрузка CPU на хосте	Утечка памяти или бесконечные циклы	1. Проверить контейнеры: docker stats
-2. Перезапустить проблемные сервисы
-3. Увеличить ресурсы хоста
-K.3. Пошаговые процедуры для критических сбоев
-K.3.1. Полная потеря связи с EVE-NG
+K.2. Common Issues and Solutions Table
+
+K.2.1. Lab Deployment Issues
+Symptom	Possible Cause	Solution
+Lab initialization timeout error in controller logs	EVE-NG API unavailable	1. Check EVE-NG status: systemctl status eve-ng
+2. Check network connectivity: ping <eve-ng-ip>
+3. Restart EVE-NG: systemctl restart eve-ng
+Terraform fails to create lab	Insufficient resources on EVE-NG host	1. Check free memory: free -h
+2. Check available images in EVE-NG
+3. Increase memory limits for virtual machines
+Ansible cannot connect to CSR1000v	Incorrect credentials or network ACLs	1. Check credentials in HashiCorp Vault
+2. Test SSH connectivity to CSR1000v from management host
+3. Check firewall settings in EVE-NG
+
+K.2.2. Attack Analyst Module Issues
+Symptom	Possible Cause	Solution
+LLM returns empty or incorrect JSON	Prompt engineering or model issue	1. Check ML service logs: docker compose logs ml-service
+2. Validate input data
+3. Reload model: curl -X POST http://ml-service:8080/models/reload
+Netmiko timeout when connecting to device	Network or device issues	1. Check device accessibility: nc -zv <device-ip> 22
+2. Increase timeouts in Netmiko configuration
+3. Check device load (CPU)
+TextFSM parser fails to process CLI output	Template mismatch	1. Verify NTC templates are up-to-date
+2. Add raw output to logs for analysis
+3. Use fallback regular expressions
+
+K.2.3. Attack Executor Module Issues
+Symptom	Possible Cause	Solution
+Ping fails even though vulnerability exists	EVE-NG networking stack issues	1. Check ARP table on CSR1000v
+2. Check destination VLAN on switch
+3. Check firewall rules on Ubuntu VM
+SSH connection to attacker host drops	Virtual machine resource issues	1. Increase VM memory in EVE-NG
+2. Check load on EVE-NG host
+3. Recreate VM from template
+
+K.2.4. Remediation Module Issues
+Symptom	Possible Cause	Solution
+Generated commands cause device error	Syntax error or unsupported command	1. Check IOS version and command syntax
+2. Enable dry-run mode for validation
+3. Use show parser dump for debugging
+Applying patch causes loss of management	Conflicting configuration	1. Automatic rollback should trigger (check rollback_logs)
+2. Check device snapshot in EVE-NG
+3. Manual restore from backup
+
+K.2.5. Performance Issues
+Symptom	Possible Cause	Solution
+Cycle time exceeds 120 minutes	GPU load or network latency	1. Check GPU utilization: nvidia-smi
+2. Optimize prompts to reduce inference time
+3. Cache analysis results for identical configurations
+High CPU load on host	Memory leak or infinite loops	1. Check containers: docker stats
+2. Restart problematic services
+3. Increase host resources
+
+K.3. Step-by-Step Procedures for Critical Failures
+
+K.3.1. Complete Loss of Connectivity to EVE-NG
 bash
 
 #!/bin/bash
 # recovery-eve-ng.sh
 
-echo "🚨 Восстановление связи с EVE-NG"
+echo "🚨 Restoring connectivity to EVE-NG"
 
-# 1. Проверка базовой связности
+# 1. Check basic connectivity
 if ! ping -c 3 ${EVE_NG_IP}; then
-    echo "❌ EVE-NG недоступен по IP"
+    echo "❌ EVE-NG unreachable by IP"
     escalate_to_network_team
     exit 1
 fi
 
-# 2. Проверка сервисов EVE-NG
+# 2. Check EVE-NG services
 if ! curl -f http://${EVE_NG_IP}:8080/api/status; then
-    echo "🔄 Перезапуск EVE-NG..."
+    echo "🔄 Restarting EVE-NG..."
     ssh root@${EVE_NG_IP} "systemctl restart eve-ng"
     sleep 60
 fi
 
-# 3. Проверка лаборатории
+# 3. Check lab status
 if ! curl -f http://${EVE_NG_IP}:8080/api/labs/zero1-mvp; then
-    echo "🔄 Восстановление лаборатории из шаблона..."
+    echo "🔄 Restoring lab from template..."
     curl -X POST http://${EVE_NG_IP}:8080/api/labs \
         -d '{"name": "zero1-mvp", "template": "zero1-base"}'
 fi
 
-# 4. Валидация
+# 4. Validation
 if curl -f http://${EVE_NG_IP}:8080/api/labs/zero1-mvp/nodes; then
-    echo "✅ EVE-NG восстановлен"
+    echo "✅ EVE-NG restored"
 else
-    echo "❌ Не удалось восстановить EVE-NG"
+    echo "❌ Failed to restore EVE-NG"
     escalate_to_level_3
 fi
 
-K.3.2. Коррупция базы данных
+K.3.2. Database Corruption
 bash
 
 #!/bin/bash
 # recovery-database-corruption.sh
 
-echo "🗄️  Восстановление после коррупции БД"
+echo "🗄️  Recovering from database corruption"
 
-# 1. Остановка записей в БД
+# 1. Stop writes to DB
 docker compose stop zero1-controller scheduler worker
 
-# 2. Проверка целостности
+# 2. Check integrity
 if ! docker compose exec postgres pg_catalog.pg_checkdb(); then
-    echo "⚠️  Обнаружена коррупция БД"
+    echo "⚠️  Database corruption detected"
     
-    # 3. Восстановление из последнего снапшота
+    # 3. Restore from latest snapshot
     LAST_BACKUP=$(aws s3 ls s3://zero1-backups/postgres/ | tail -1 | awk '{print $4}')
     aws s3 cp s3://zero1-backups/postgres/${LAST_BACKUP} /tmp/recovery.sql.gz
     
-    # 4. Восстановление
+    # 4. Perform restoration
     gunzip -c /tmp/recovery.sql.gz | docker compose exec -T postgres psql -U zero1
     
-    # 5. Проверка
+    # 5. Verification
     docker compose exec postgres psql -U zero1 -c "SELECT COUNT(*) FROM test_cycles;"
 fi
 
-# 6. Запуск сервисов
+# 6. Start services
 docker compose start zero1-controller scheduler worker
 
-K.4. Диагностические утилиты
-K.4.1. Скрипт диагностики системы
+K.4. Diagnostic Utilities
+
+K.4.1. System Diagnostic Script
 python
 
 #!/usr/bin/env python3
 """
-zero1-diagnostic.py - Комплексная диагностика системы
+zero1-diagnostic.py - Comprehensive system diagnostic
 """
 
 import subprocess
@@ -159,7 +174,7 @@ import requests
 from datetime import datetime
 
 def check_docker_services():
-    """Проверка состояния Docker сервисов"""
+    """Check Docker service states"""
     result = subprocess.run(
         ["docker", "compose", "ps", "--format", "json"],
         capture_output=True, text=True
@@ -175,10 +190,10 @@ def check_docker_services():
     }
 
 def check_api_endpoints():
-    """Проверка доступности API endpoints"""
+    """Check API endpoint availability"""
     endpoints = [
-        ("Контроллер", "http://localhost:8000/api/v1/health"),
-        ("ML-сервис", "http://localhost:8080/health"),
+        ("Controller", "http://localhost:8000/api/v1/health"),
+        ("ML Service", "http://localhost:8080/health"),
         ("MinIO", "http://localhost:9000/minio/health/live"),
         ("Elasticsearch", "http://localhost:9200/_cluster/health"),
     ]
@@ -202,14 +217,14 @@ def check_api_endpoints():
     return results
 
 def check_resource_usage():
-    """Проверка использования ресурсов"""
-    # Проверка диска
+    """Check resource utilization"""
+    # Check disk
     disk = subprocess.run(
         ["df", "-h", "/var/lib/docker"],
         capture_output=True, text=True
     ).stdout
     
-    # Проверка памяти
+    # Check memory
     memory = subprocess.run(
         ["free", "-h"],
         capture_output=True, text=True
@@ -218,7 +233,7 @@ def check_resource_usage():
     return {"disk": disk, "memory": memory}
 
 def generate_report():
-    """Генерация диагностического отчета"""
+    """Generate diagnostic report"""
     report = {
         "timestamp": datetime.now().isoformat(),
         "docker_services": check_docker_services(),
@@ -227,16 +242,16 @@ def generate_report():
         "recommendations": []
     }
     
-    # Анализ и рекомендации
+    # Analysis and recommendations
     if report["docker_services"]["unhealthy"] > 0:
         report["recommendations"].append(
-            "Перезапустить неисправные сервисы: ./manage-system.sh restart"
+            "Restart faulty services: ./manage-system.sh restart"
         )
     
     unhealthy_apis = [e for e in report["api_endpoints"] if e["status"] != "healthy"]
     if unhealthy_apis:
         report["recommendations"].append(
-            f"Восстановить API endpoints: {[e['service'] for e in unhealthy_apis]}"
+            f"Restore API endpoints: {[e['service'] for e in unhealthy_apis]}"
         )
     
     return report
@@ -245,7 +260,7 @@ if __name__ == "__main__":
     report = generate_report()
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
-K.4.2. Мониторинг в реальном времени
+K.4.2. Real-time Monitoring
 bash
 
 #!/bin/bash
@@ -253,21 +268,23 @@ bash
 
 watch -n 5 '
 echo "=== Project ZERO-1 Live Monitor ==="
-echo "Время: $(date)"
+echo "Time: $(date)"
 echo ""
-echo "1. Состояние сервисов:"
+echo "1. Service Status:"
 docker compose ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}"
 echo ""
-echo "2. Использование ресурсов:"
+echo "2. Resource Usage:"
 docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
 echo ""
-echo "3. Активные циклы:"
+echo "3. Active Cycles:"
 docker compose exec -T postgres psql -U zero1 -c "SELECT cycle_id, overall_status, start_time FROM test_cycles WHERE overall_status = '"'"'running'"'"';"
 '
 
-Appendix L: Политики безопасности и compliance (Security Policies)
-L.1. Базовые принципы безопасности
-L.1.1. Принцип наименьших привилегий (Least Privilege)
+Appendix L: Security Policies and Compliance
+
+L.1. Core Security Principles
+
+L.1.1. Principle of Least Privilege
 yaml
 
 # zero1-rbac-policies.yml
@@ -302,15 +319,16 @@ role_definitions:
 L.1.2. Defense in Depth
 text
 
-Уровень 1: Сетевая сегментация (EVE-NG изолированная сеть)
-Уровень 2: Аутентификация (JWT + MFA)
-Уровень 3: Авторизация (RBAC)
-Уровень 4: Шифрование (TLS 1.3, encrypted volumes)
-Уровень 5: Аудит (полная traceability, immutable logs)
-Уровень 6: Криптографическая верификация (Merkle trees, hardware signing)
+Level 1: Network Segmentation (EVE-NG isolated network)
+Level 2: Authentication (JWT + MFA)
+Level 3: Authorization (RBAC)
+Level 4: Encryption (TLS 1.3, encrypted volumes)
+Level 5: Audit (full traceability, immutable logs)
+Level 6: Cryptographic Verification (Merkle trees, hardware signing)
 
-L.2. Политики обработки данных
-L.2.1. Классификация данных
+L.2. Data Handling Policies
+
+L.2.1. Data Classification
 yaml
 
 data_classes:
@@ -319,45 +337,45 @@ data_classes:
     - security_findings
     - credentials
     - digital_signatures
-    retention: 7 лет
-    encryption: обязательное (AES-256-GCM)
-    access_logging: полное
+    retention: 7 years
+    encryption: mandatory (AES-256-GCM)
+    access_logging: full
     
   internal:
     - system_logs
     - performance_metrics
     - ml_model_weights
-    retention: 1 год
-    encryption: рекомендованное
-    access_logging: агрегированное
+    retention: 1 year
+    encryption: recommended
+    access_logging: aggregated
     
   public:
     - anonymized_statistics
     - compliance_reports
     - system_status
-    retention: 5 лет
-    encryption: не требуется
-    access_logging: минимальное
+    retention: 5 years
+    encryption: not required
+    access_logging: minimal
 
-L.2.2. Политика хранения и удаления
+L.2.2. Retention and Deletion Policy
 bash
 
 #!/bin/bash
 # data-retention-policy.sh
 
-# Автоматическое удаление старых данных
+# Automatic deletion of old data
 RETENTION_DAYS=365
 
-echo "🧹 Применение политики хранения данных..."
+echo "🧹 Applying data retention policy..."
 
-# 1. Удаление старых циклов из БД
+# 1. Delete old cycles from database
 docker compose exec -T postgres psql -U zero1 -c "
     DELETE FROM test_cycles 
     WHERE created_at < NOW() - INTERVAL '${RETENTION_DAYS} days'
     AND overall_status != 'running';
 "
 
-# 2. Удаление соответствующих артефактов из MinIO
+# 2. Delete corresponding artifacts from MinIO
 CYCLES_TO_DELETE=$(docker compose exec -T postgres psql -U zero1 -t -c "
     SELECT cycle_id FROM test_cycles 
     WHERE created_at < NOW() - INTERVAL '${RETENTION_DAYS} days';
@@ -367,10 +385,11 @@ for CYCLE in $CYCLES_TO_DELETE; do
     docker compose run --rm mc rm --recursive --force minio/zero1-artifacts/cycles/${CYCLE}
 done
 
-# 3. Rotate логов Elasticsearch
+# 3. Rotate Elasticsearch logs
 curl -X POST "http://localhost:9200/_ilm/policy/zero1_logs_policy/_execute"
 
-L.3. Соответствие стандартам
+L.3. Standards Compliance
+
 L.3.1. DISA STIG Compliance
 yaml
 
@@ -394,24 +413,24 @@ stig_compliance_framework:
 
   validation_procedures:
     quarterly_audit:
-      frequency: "каждые 3 месяца"
-      scope: "все проверки STIG"
-      method: "автоматический + ручная выборочная проверка"
+      frequency: "every 3 months"
+      scope: "all STIG checks"
+      method: "automated + manual sampling"
       responsible: "Chief Security Officer"
     
     continuous_compliance:
-      frequency: "непрерывно"
-      scope: "активные проверки"
-      method: "автоматический мониторинг"
+      frequency: "continuous"
+      scope: "active checks"
+      method: "automated monitoring"
       alerts: "Kibana + Slack notifications"
 
-L.3.2. NIST Cybersecurity Framework
+L.3.2. NIST Cybersecurity Framework Mapping
 yaml
 
 nist_csf_mapping:
   identify:
-    - asset_management: "Реестр всех сетевых устройств"
-    - risk_assessment: "Оценка рисков на основе STIG findings"
+    - asset_management: "Inventory of all network devices"
+    - risk_assessment: "Risk assessment based on STIG findings"
     
   protect:
     - access_control: "RBAC, MFA, network segmentation"
@@ -430,8 +449,9 @@ nist_csf_mapping:
     - recovery_planning: "Backup and restore procedures"
     - improvements: "Lessons learned from failed cycles"
 
-L.4. Криптографические политики
-L.4.1. Управление ключами
+L.4. Cryptographic Policies
+
+L.4.1. Key Management Policy
 yaml
 
 key_management_policy:
@@ -440,17 +460,17 @@ key_management_policy:
     backup: "Thales HSM (off-site)"
     
   key_generation:
-    algorithm: "RSA 4096 или ECC P-384"
+    algorithm: "RSA 4096 or ECC P-384"
     source: "HSM hardware random generator"
-    ceremony: "два оператора + witness"
+    ceremony: "two operators + witness"
     
   key_storage:
-    private_keys: "никогда не покидают HSM"
-    public_keys: "хранятся в HashiCorp Vault с ACL"
+    private_keys: "never leave HSM"
+    public_keys: "stored in HashiCorp Vault with ACL"
     
   key_rotation:
-    frequency: "ежегодно или при компрометации"
-    procedure: "генерировать новую пару, переподписать архив"
+    frequency: "annually or upon compromise"
+    procedure: "generate new key pair, re-sign archive"
     
   revocation:
     conditions:
@@ -459,7 +479,7 @@ key_management_policy:
       - key_expiration
     mechanism: "CRL + OCSP stapling"
 
-L.4.2. Политика подписания
+L.4.2. Signing Policy
 python
 
 # signing-policy.py
@@ -468,7 +488,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from datetime import datetime, timedelta
 
 class SigningPolicy:
-    """Политика криптографического подписания"""
+    """Cryptographic signing policy"""
     
     VALID_ALGORITHMS = ["RSASSA-PSS", "ECDSA-SHA384"]
     MIN_KEY_SIZE = {"RSA": 3072, "ECC": 256}
@@ -476,7 +496,7 @@ class SigningPolicy:
     
     @classmethod
     def validate_signature_context(cls, artifact_type, signer_role):
-        """Валидация контекста подписания"""
+        """Validate signing context"""
         requirements = {
             "final_report": {
                 "allowed_signers": ["zero1_system", "auditor"],
@@ -499,14 +519,15 @@ class SigningPolicy:
         
         return req
 
-L.5. Политика аудита и мониторинга
-L.5.1. Неизменяемое логирование
+L.5. Audit and Monitoring Policy
+
+L.5.1. Immutable Logging
 bash
 
 #!/bin/bash
 # immutable-logs-setup.sh
 
-# Настройка аудита Docker
+# Configure Docker auditing
 cat > /etc/docker/daemon.json << EOF
 {
   "log-driver": "local",
@@ -519,70 +540,72 @@ cat > /etc/docker/daemon.json << EOF
 }
 EOF
 
-# Настройка аудита системы
+# Configure system auditing
 echo "Setting up immutable audit logs..."
 auditctl -w /var/log/zero1/ -p wa -k zero1_audit
 auditctl -w /opt/zero1/config/ -p wa -k zero1_config
 
-# Настройка журналирования в WORM storage
+# Configure WORM storage for audit logs
 echo "Configuring WORM storage for audit logs..."
 mkdir -p /mnt/worm-storage/zero1-audit
 chattr +i /mnt/worm-storage/zero1-audit
 
-L.5.2. Политика реагирования на инциденты
+L.5.2. Incident Response Policy
 yaml
 
 incident_response_policy:
   classification:
     severity_levels:
       critical:
-        response_time: "15 минут"
+        response_time: "15 minutes"
         escalation: "CISO + Legal"
         examples:
-          - "компрометация корневого ключа"
-          - "несанкционированное изменение конфигурации"
+          - "root key compromise"
+          - "unauthorized configuration change"
       
       high:
-        response_time: "1 час"
+        response_time: "1 hour"
         escalation: "Security Team Lead"
         examples:
-          - "обход аутентификации"
-          - "утечка конфиденциальных данных"
+          - "authentication bypass"
+          - "confidential data leak"
   
   procedures:
     containment:
-      - "изоляция затронутых систем"
-      - "отключение компрометированных учетных записей"
-      - "активация резервных систем"
+      - "isolate affected systems"
+      - "disable compromised accounts"
+      - "activate backup systems"
     
     eradication:
-      - "патчинг уязвимостей"
-      - "удаление вредоносного кода"
-      - "смена всех затронутых ключей"
+      - "patch vulnerabilities"
+      - "remove malicious code"
+      - "rotate all affected keys"
     
     recovery:
-      - "восстановление из доверенных бэкапов"
-      - "валидация целостности системы"
-      - "постепенное возвращение к нормальной работе"
+      - "restore from trusted backups"
+      - "validate system integrity"
+      - "gradual return to normal operations"
     
     lessons_learned:
-      frequency: "после каждого инцидента уровня critical или high"
+      frequency: "after every critical or high severity incident"
       deliverables:
-        - "отчет об инциденте"
-        - "обновление процедур"
-        - "обновление training материалов"
+        - "incident report"
+        - "updated procedures"
+        - "updated training materials"
 
-Appendix M: Интеграционные тесты и тестовые сценарии
-M.1. Архитектура тестирования
-M.1.1. Тестовая пирамида
+Appendix M: Integration Tests and Test Scenarios
+
+M.1. Testing Architecture
+
+M.1.1. Test Pyramid
 text
 
-        ↗ E2E тесты (10%) - Полные циклы
-       ↗ Интеграционные тесты (20%) - Взаимодействие модулей
-     ↗ Компонентные тесты (30%) - Отдельные модули
-   ↗ Юнит тесты (40%) - Функции и классы
+        ↗ E2E Tests (10%) - Full cycles
+       ↗ Integration Tests (20%) - Module interactions
+     ↗ Component Tests (30%) - Individual modules
+   ↗ Unit Tests (40%) - Functions and classes
 
-M.1.2. Тестовое окружение
+M.1.2. Test Environment
 yaml
 
 # docker-compose.test.yml
@@ -618,8 +641,9 @@ services:
       - test-elasticsearch
       - mock-eve-ng
 
-M.2. Интеграционные тесты
-M.2.1. Тест полного цикла (End-to-End)
+M.2. Integration Tests
+
+M.2.1. Full Cycle Test (End-to-End)
 python
 
 # tests/test_full_cycle.py
@@ -630,11 +654,11 @@ from zero1_controller import CycleController
 from zero1_orchestrator import Orchestrator
 
 class TestFullCycle:
-    """Тестирование полного цикла от обнаружения до верификации"""
+    """Testing full cycle from detection to verification"""
     
     @pytest.fixture
     def test_environment(self):
-        """Подготовка тестового окружения"""
+        """Prepare test environment"""
         return {
             "device_ip": "192.168.1.1",
             "device_type": "cisco_csr1000v",
@@ -643,35 +667,35 @@ class TestFullCycle:
         }
     
     def test_cycle_happy_path(self, test_environment):
-        """Тест успешного выполнения полного цикла"""
+        """Test successful execution of full cycle"""
         
-        # 1. Инициализация контроллера
+        # 1. Initialize controller
         controller = CycleController(test_mode=True)
         
-        # 2. Запуск цикла
+        # 2. Start cycle
         cycle_id = controller.start_cycle(
             stig_id=test_environment["stig_id"],
             target_device=test_environment["device_ip"]
         )
         
-        # 3. Мониторинг выполнения
-        max_wait_time = 7200  # 120 минут
+        # 3. Monitor execution
+        max_wait_time = 7200  # 120 minutes
         start_time = datetime.now()
         
         while (datetime.now() - start_time).seconds < max_wait_time:
             status = controller.get_cycle_status(cycle_id)
             
             if status["overall_status"] == "completed":
-                # 4. Проверка результатов
+                # 4. Verify results
                 report = controller.get_cycle_report(cycle_id)
                 
-                # Проверки
+                # Assertions
                 assert report["verification_result"] == True
                 assert report["digital_signature"] is not None
                 assert len(report["artifacts"]) >= 9  # A1-A9
                 assert report["merkle_root_verified"] == True
                 
-                return  # Успех
+                return  # Success
             
             elif status["overall_status"] == "failed":
                 pytest.fail(f"Cycle failed: {status.get('error_message')}")
@@ -679,20 +703,20 @@ class TestFullCycle:
         pytest.fail("Cycle timeout")
     
     def test_rollback_scenario(self):
-        """Тест отката при ошибке применения патча"""
+        """Test rollback during patch application failure"""
         
-        # 1. Внедрение сбоя
+        # 1. Induce failure
         sabotaged_device = MockDevice()
         sabotaged_device.set_failure_mode("config_apply_failure")
         
-        # 2. Запуск цикла
+        # 2. Start cycle
         controller = CycleController()
         cycle_id = controller.start_cycle(
             stig_id="V-220668",
             target_device=sabotaged_device
         )
         
-        # 3. Проверка отката
+        # 3. Verify rollback
         status = controller.wait_for_completion(cycle_id, timeout=300)
         
         assert status["overall_status"] == "rollback"
@@ -700,63 +724,63 @@ class TestFullCycle:
         assert controller.rollback_logs_contain(cycle_id, "Remediation Applier") == True
     
     def test_llm_fallback_mechanism(self):
-        """Тест работы fallback при сбое LLM"""
+        """Test fallback operation during LLM failure"""
         
-        # 1. Отключение ML-сервиса
+        # 1. Disable ML service
         ml_service.stop()
         
-        # 2. Запуск цикла
+        # 2. Start cycle
         controller = CycleController()
         cycle_id = controller.start_cycle(...)
         
-        # 3. Проверка использования fallback-правил
+        # 3. Verify fallback rules usage
         artifacts = controller.get_artifacts(cycle_id)
         analysis_artifact = artifacts.get_by_type("llm_analysis")
         
-        # Должен использоваться rule-based анализатор
+        # Should use rule-based analyzer
         assert analysis_artifact["generator"] == "rule_based_fallback"
         assert analysis_artifact["contains_finding"] == True
         
-        # 4. Проверка завершения цикла
+        # 4. Verify cycle completion
         status = controller.wait_for_completion(cycle_id)
         assert status["overall_status"] == "completed"
 
-M.2.2. Тесты взаимодействия модулей
+M.2.2. Module Interaction Tests
 python
 
 # tests/test_module_integration.py
 class TestModuleIntegration:
     
     def test_attack_analyst_to_executor_flow(self):
-        """Тест передачи плана атаки от Analyst к Executor"""
+        """Test attack plan handoff from Analyst to Executor"""
         
-        # 1. Analyst генерирует план
+        # 1. Analyst generates plan
         analyst = AttackAnalyst()
         config = get_test_device_config()
         analysis = analyst.analyze(config, stig_id="V-220668")
         
-        # 2. Проверка структуры плана
+        # 2. Verify plan structure
         assert "attack_plan" in analysis
         assert "steps" in analysis["attack_plan"]
         assert len(analysis["attack_plan"]["steps"]) > 0
         
-        # 3. Executor выполняет план
+        # 3. Executor executes plan
         executor = AttackExecutor()
         result = executor.execute(analysis["attack_plan"])
         
-        # 4. Проверка результатов
+        # 4. Verify results
         assert "attack_successful" in result
         assert "evidence" in result
         assert "timestamp" in result
         
-        # 5. Проверка соответствия ожиданиям
+        # 5. Verify expectations match
         if analysis["findings"][0]["severity"] == "medium":
             assert result["attack_successful"] == True
     
     def test_remediation_synthesis_and_application(self):
-        """Тест синтеза и применения исправления"""
+        """Test remediation synthesis and application"""
         
-        # 1. Подготовка данных
+        # 1. Prepare data
         vulnerability = {
             "stig_id": "V-220668",
             "description": "Interface Gi2 in default VLAN 1",
@@ -768,31 +792,31 @@ class TestModuleIntegration:
             "evidence": "ping succeeded to 192.168.1.100"
         }
         
-        # 2. Синтез исправления
+        # 2. Synthesize remediation
         synthesizer = RemediationSynthesizer()
         patch = synthesizer.generate(
             vulnerability=vulnerability,
             context=attack_report
         )
         
-        # 3. Валидация синтаксиса
+        # 3. Validate syntax
         assert patch.validate_syntax() == True
         assert "interface GigabitEthernet2" in patch.commands
         assert "switchport access vlan 100" in patch.commands
         
-        # 4. Применение (dry-run)
+        # 4. Apply (dry-run)
         applier = RemediationApplier(dry_run=True)
         apply_result = applier.apply(patch, target_device)
         
-        # 5. Проверка
+        # 5. Verify
         assert apply_result["success"] == True
         assert apply_result["validation_passed"] == True
         assert apply_result["rollback_prepared"] == True
     
     def test_evidence_chain_integrity(self):
-        """Тест целостности цепочки доказательств"""
+        """Test evidence chain integrity"""
         
-        # 1. Сбор артефактов тестового цикла
+        # 1. Collect test cycle artifacts
         artifacts = [
             Artifact(type="config", data=initial_config, hash=sha256(initial_config)),
             Artifact(type="analysis", data=analysis_report, hash=sha256(analysis_report)),
@@ -801,11 +825,11 @@ class TestModuleIntegration:
             Artifact(type="verification", data=verification, hash=sha256(verification))
         ]
         
-        # 2. Построение Merkle Tree
+        # 2. Build Merkle Tree
         merkle_builder = MerkleTreeBuilder()
         tree = merkle_builder.build(artifacts)
         
-        # 3. Проверка целостности
+        # 3. Verify integrity
         for artifact in artifacts:
             proof = tree.get_proof(artifact.hash)
             assert merkle_builder.verify_proof(
@@ -814,90 +838,91 @@ class TestModuleIntegration:
                 root_hash=tree.root
             ) == True
         
-        # 4. Подписание и верификация
+        # 4. Sign and verify
         signer = DigitalSigner()
         signature = signer.sign(tree.root)
         
         assert signer.verify(tree.root, signature) == True
 
-M.3. Тестовые сценарии
-M.3.1. Таблица тестовых сценариев
+M.3. Test Scenarios
+
+M.3.1. Test Scenario Table
 yaml
 
 test_scenarios:
   - id: "SCENARIO-001"
-    name: "Успешное обнаружение и исправление уязвимости"
+    name: "Successful vulnerability detection and remediation"
     preconditions:
-      - "Устройство имеет порт в VLAN 1"
-      - "Целевой хост доступен в VLAN 1"
+      - "Device has port in VLAN 1"
+      - "Target host accessible in VLAN 1"
     steps:
-      - "Запуск цикла с STIG V-220668"
-      - "Ожидание завершения"
+      - "Start cycle with STIG V-220668"
+      - "Wait for completion"
     expected_results:
-      - "Цикл завершен со статусом completed"
-      - "Отчет содержит цифровую подпись"
-      - "Порт перемещен в VLAN 100"
-      - "Повторная атака неуспешна"
+      - "Cycle completed with status 'completed'"
+      - "Report contains digital signature"
+      - "Port moved to VLAN 100"
+      - "Follow-up attack unsuccessful"
     
   - id: "SCENARIO-002"
-    name: "Обработка ложноположительного срабатывания"
+    name: "False positive handling"
     preconditions:
-      - "Устройство НЕ имеет портов в VLAN 1"
-      - "LLM настроен на гиперчувствительность"
+      - "Device does NOT have ports in VLAN 1"
+      - "LLM configured for high sensitivity"
     steps:
-      - "Запуск цикла с STIG V-220668"
-      - "Мониторинг логов"
+      - "Start cycle with STIG V-220668"
+      - "Monitor logs"
     expected_results:
-      - "Attack Analyst не обнаруживает уязвимость"
-      - "Цикл завершается досрочно с appropriate статусом"
-      - "В логах запись о проверке и отсутствии findings"
+      - "Attack Analyst does not detect vulnerability"
+      - "Cycle ends early with appropriate status"
+      - "Logs contain entry about check and no findings"
     
   - id: "SCENARIO-003"
-    name: "Восстановление после сетевого сбоя"
+    name: "Network failure recovery"
     preconditions:
-      - "Цикл запущен"
-      - "Сетевое соединение с устройством нестабильно"
+      - "Cycle started"
+      - "Network connection to device unstable"
     steps:
-      - "Имитация обрыва сети во время анализа"
-      - "Восстановление сети через 60 секунд"
+      - "Simulate network outage during analysis"
+      - "Restore network after 60 seconds"
     expected_results:
-      - "Система выполняет retry (до 3 попыток)"
-      - "При неудаче - корректный откат"
-      - "Логи содержат записи о таймаутах и retry"
+      - "System performs retry (up to 3 attempts)"
+      - "On failure - clean rollback"
+      - "Logs contain timeout and retry entries"
     
   - id: "SCENARIO-004"
-    name: "Обработка отказа ML-сервиса"
+    name: "ML service failure handling"
     preconditions:
-      - "ML-сервис работает нестабильно"
-      - "Fallback правила настроены"
+      - "ML service unstable"
+      - "Fallback rules configured"
     steps:
-      - "Остановка ML-сервиса во время анализа"
-      - "Мониторинг реакции системы"
+      - "Stop ML service during analysis"
+      - "Monitor system response"
     expected_results:
-      - "Система переключается на rule-based анализатор"
-      - "Цикл завершается успешно (возможно с degraded точностью)"
-      - "Логи содержат warning о fallback активации"
+      - "System switches to rule-based analyzer"
+      - "Cycle completes successfully (possibly with degraded accuracy)"
+      - "Logs contain warning about fallback activation"
     
   - id: "SCENARIO-005"
-    name: "Проверка производительности под нагрузкой"
+    name: "Performance testing under load"
     preconditions:
-      - "Система развернута в production-конфигурации"
-      - "10 виртуальных устройств готовы к тестированию"
+      - "System deployed in production configuration"
+      - "10 virtual devices ready for testing"
     steps:
-      - "Параллельный запуск 10 циклов"
-      - "Мониторинг метрик в течение 2 часов"
+      - "Parallel launch of 10 cycles"
+      - "Monitor metrics for 2 hours"
     expected_results:
-      - "Все циклы завершаются в течение 120 минут"
-      - "Использование GPU не превышает 80%"
-      - "Не более 5% циклов требуют отката"
-      - "Среднее время цикла < 90 минут"
+      - "All cycles complete within 120 minutes"
+      - "GPU utilization does not exceed 80%"
+      - "No more than 5% of cycles require rollback"
+      - "Average cycle time < 90 minutes"
 
-M.3.2. Скрипт выполнения тестовых сценариев
+M.3.2. Test Scenario Execution Script
 python
 
 #!/usr/bin/env python3
 """
-test-scenario-runner.py - Выполнение тестовых сценариев
+test-scenario-runner.py - Execute test scenarios
 """
 
 import yaml
@@ -929,7 +954,7 @@ class TestScenarioRunner:
         self.results = []
     
     async def run_scenario(self, scenario: Dict) -> TestResult:
-        """Выполнение одного тестового сценария"""
+        """Execute single test scenario"""
         result = TestResult(
             scenario_id=scenario['id'],
             status=TestStatus.RUNNING,
@@ -939,10 +964,10 @@ class TestScenarioRunner:
         )
         
         try:
-            # Подготовка окружения
+            # Prepare environment
             await self.setup_environment(scenario['preconditions'])
             
-            # Выполнение шагов
+            # Execute steps
             start_time = asyncio.get_event_loop().time()
             
             for step in scenario['steps']:
@@ -950,7 +975,7 @@ class TestScenarioRunner:
             
             result.duration = asyncio.get_event_loop().time() - start_time
             
-            # Проверка ожидаемых результатов
+            # Verify expected results
             await self.verify_results(scenario['expected_results'], result)
             
             result.status = TestStatus.PASSED
@@ -965,23 +990,23 @@ class TestScenarioRunner:
         return result
     
     async def run_all_scenarios(self):
-        """Выполнение всех сценариев"""
-        print(f"🚀 Запуск {len(self.scenarios)} тестовых сценариев")
+        """Execute all scenarios"""
+        print(f"🚀 Executing {len(self.scenarios)} test scenarios")
         
         for scenario in self.scenarios:
-            print(f"\n📋 Выполнение сценария: {scenario['name']}")
+            print(f"\n📋 Executing scenario: {scenario['name']}")
             
             result = await self.run_scenario(scenario)
             self.results.append(result)
             
-            print(f"   Статус: {result.status.value}")
-            print(f"   Длительность: {result.duration:.2f} секунд")
+            print(f"   Status: {result.status.value}")
+            print(f"   Duration: {result.duration:.2f} seconds")
         
-        # Генерация отчета
+        # Generate report
         self.generate_report()
     
     def generate_report(self):
-        """Генерация итогового отчета"""
+        """Generate final report"""
         passed = sum(1 for r in self.results if r.status == TestStatus.PASSED)
         failed = sum(1 for r in self.results if r.status == TestStatus.FAILED)
         
@@ -1003,14 +1028,14 @@ class TestScenarioRunner:
             ]
         }
         
-        # Сохранение отчета
+        # Save report
         with open('/tmp/test_execution_report.json', 'w') as f:
             json.dump(report, f, indent=2)
         
-        print(f"\n📊 Итоговый отчет:")
-        print(f"   Успешно: {passed}/{len(self.results)}")
-        print(f"   Успешность: {report['summary']['success_rate']:.1f}%")
-        print(f"   Отчет сохранен: /tmp/test_execution_report.json")
+        print(f"\n📊 Final Report:")
+        print(f"   Successful: {passed}/{len(self.results)}")
+        print(f"   Success rate: {report['summary']['success_rate']:.1f}%")
+        print(f"   Report saved: /tmp/test_execution_report.json")
 
 async def main():
     runner = TestScenarioRunner('test_scenarios.yml')
@@ -1019,8 +1044,9 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 
-M.4. Непрерывная интеграция и тестирование
-M.4.1. Конфигурация GitHub Actions
+M.4. Continuous Integration and Testing
+
+M.4.1. GitHub Actions Configuration
 yaml
 
 # .github/workflows/ci-cd.yml
@@ -1101,7 +1127,7 @@ jobs:
           name: performance-report
           path: performance_results*.csv
 
-M.4.2. Качество кода и стандарты
+M.4.2. Code Quality and Standards
 yaml
 
 # .pre-commit-config.yaml
@@ -1144,41 +1170,40 @@ repos:
       - id: commitizen
         stages: [commit-msg]
 
-Итоговый анализ созданных разделов:
-1. Полнота покрытия
+Final Analysis of Created Sections:
 
-Созданные разделы дополняют существующую документацию, обеспечивая:
+    Coverage Completeness
 
-    Операционную готовность через troubleshooting guide
+    The created sections complement the existing documentation by providing:
 
-    Соответствие регуляторным требованиям через security policies
+        Operational readiness through troubleshooting guide
 
-    Надежность и качество через интеграционные тесты
+        Regulatory compliance through security policies
 
-2. Согласованность с архитектурой
+        Reliability and quality through integration tests
 
-Все разделы:
+    Architectural Consistency
 
-    Ссылаются на существующие компоненты системы
+    All sections:
 
-    Используют определенные в ТЗ технологии и инструменты
+        Reference existing system components
 
-    Соответствуют заявленным требованиям и ограничениям
+        Utilize technologies and tools defined in the SOW
 
-3. Практическая применимость
+        Comply with stated requirements and constraints
 
-    Troubleshooting guide содержит конкретные команды и процедуры
+    Practical Applicability
 
-    Security policies реализуемы и проверяемы
+        Troubleshooting guide contains specific commands and procedures
 
-    Тестовые сценарии покрывают все критические пути системы
+        Security policies are implementable and verifiable
 
-4. Масштабируемость
+        Test scenarios cover all critical system paths
 
-    Диагностические процедуры можно расширять для новых модулей
+    Scalability
 
-    Политики безопасности адаптируются под новые compliance требования
+        Diagnostic procedures can be extended for new modules
 
-    Тестовая инфраструктура поддерживает добавление новых сценариев
+        Security policies can be adapted to new compliance requirements
 
-
+        Test infrastructure supports addition of new scenarios
